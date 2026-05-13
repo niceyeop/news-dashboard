@@ -1030,7 +1030,7 @@ def get_stored_ai_insight():
         return cached_result["data"]
 
     return {
-        "error": "저장된 AI 분석 결과가 아직 없습니다. 다음 10분 갱신 후 표시됩니다.",
+        "error": "저장된 AI 분석 결과를 생성 중입니다. 잠시 후 새로고침하면 표시됩니다.",
         "raw": None
     }
 
@@ -1113,6 +1113,10 @@ def start_ai_refresh_scheduler(api_key):
     init_ai_store()
     if not api_key:
         return False
+
+    cached_result = get_cached_ai_result()
+    if not (isinstance(cached_result, dict) and cached_result.get("data")):
+        refresh_ai_for_slot(api_key, get_current_refresh_slot(), AI_CACHE_VERSION)
 
     thread = threading.Thread(
         target=ai_refresh_scheduler_worker,

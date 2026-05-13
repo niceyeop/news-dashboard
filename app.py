@@ -7,7 +7,7 @@ import json
 import html
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import pytz
 from streamlit_autorefresh import st_autorefresh
@@ -18,7 +18,7 @@ st.set_page_config(page_title="주요 언론사 뉴스 대시보드", page_icon=
 TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-GEMINI_MIN_REFRESH_SECONDS = 600
+REFRESH_INTERVAL_MINUTES = 10
 GEMINI_MAX_REQUESTS_PER_MINUTE = 14
 GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
 GEMINI_MAX_REQUESTS_PER_DAY = 144
@@ -280,9 +280,32 @@ def release_refresh_lock():
         pass
 
 
+def get_kst_now():
+    return datetime.now(pytz.timezone("Asia/Seoul"))
+
+
+def get_current_refresh_slot():
+    now = get_kst_now()
+    slot_minute = (now.minute // REFRESH_INTERVAL_MINUTES) * REFRESH_INTERVAL_MINUTES
+    slot = now.replace(minute=slot_minute, second=0, microsecond=0)
+    return slot.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def milliseconds_until_next_refresh_slot():
+    now = get_kst_now()
+    next_minute = ((now.minute // REFRESH_INTERVAL_MINUTES) + 1) * REFRESH_INTERVAL_MINUTES
+
+    if next_minute >= 60:
+        next_slot = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    else:
+        next_slot = now.replace(minute=next_minute, second=0, microsecond=0)
+
+    milliseconds = int((next_slot - now).total_seconds() * 1000)
+    return max(milliseconds, 1000)
+
+
 def is_fresh_ai_cache(cache_payload):
-    generated_at = cache_payload.get("generated_at")
-    return isinstance(generated_at, (int, float)) and time.time() - generated_at < GEMINI_MIN_REFRESH_SECONDS
+    return cache_payload.get("refresh_slot") == get_current_refresh_slot()
 
 
 def reserve_gemini_capacity(input_text):
@@ -532,8 +555,8 @@ def normalize_url(url):
     return url
 
 
-@st.cache_data(ttl=600)
-def fetch_news():
+@st.cache_data
+def fetch_news(refresh_slot):
     results = {}
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -966,6 +989,7 @@ def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
         parsed = sanitize_ai_payload(parsed)
         write_json_file(AI_RESULT_CACHE_PATH, {
             "generated_at": time.time(),
+            "refresh_slot": get_current_refresh_slot(),
             "cache_version": cache_version,
             "model": GEMINI_MODEL_NAME,
             "data": parsed,
@@ -1133,7 +1157,8 @@ def render_local_missed_articles(news_data):
 
 
 api_key = get_gemini_api_key()
-st_autorefresh(interval=600 * 1000, limit=None, key="news_autorefresh")
+refresh_slot = get_current_refresh_slot()
+st_autorefresh(interval=milliseconds_until_next_refresh_slot(), limit=None, key="news_autorefresh")
 
 
 # =========================
@@ -1146,7 +1171,7 @@ st.markdown(
 )
 
 with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
-    news_data = fetch_news()
+    news_data = fetch_news(refresh_slot)
 
 
 # =========================

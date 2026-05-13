@@ -1,13 +1,14 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from collections import Counter, deque
+from collections import Counter
 import re
 import json
 import html
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 import pytz
 from streamlit_autorefresh import st_autorefresh
 
@@ -17,9 +18,15 @@ st.set_page_config(page_title="주요 언론사 뉴스 대시보드", page_icon=
 TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+GEMINI_MIN_REFRESH_SECONDS = 600
 GEMINI_MAX_REQUESTS_PER_MINUTE = 14
 GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
-GEMINI_MAX_REQUESTS_PER_DAY = 499
+GEMINI_MAX_REQUESTS_PER_DAY = 144
+AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
+AI_RESULT_CACHE_PATH = AI_CACHE_DIR / "ai_insight_cache.json"
+GEMINI_REQUEST_LOG_PATH = AI_CACHE_DIR / "gemini_request_log.json"
+AI_REFRESH_LOCK_PATH = AI_CACHE_DIR / "ai_refresh.lock"
+AI_REFRESH_LOCK_TTL_SECONDS = 120
 
 
 # =========================
@@ -225,32 +232,75 @@ def get_gemini_api_key():
     return key.strip() if key else ""
 
 
-@st.cache_resource
-def get_gemini_usage_tracker():
-    return {
-        "minute": deque(),
-        "day": deque(),
-    }
-
-
 def estimate_input_tokens(text):
     return max(1, len(str(text).encode("utf-8")) // 3)
 
 
+def read_json_file(path, default):
+    try:
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json_file(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def acquire_refresh_lock():
+    AI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+
+    try:
+        if AI_REFRESH_LOCK_PATH.exists() and now - AI_REFRESH_LOCK_PATH.stat().st_mtime > AI_REFRESH_LOCK_TTL_SECONDS:
+            AI_REFRESH_LOCK_PATH.unlink()
+    except Exception:
+        pass
+
+    try:
+        fd = os.open(str(AI_REFRESH_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+            lock_file.write(str(now))
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_refresh_lock():
+    try:
+        AI_REFRESH_LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def is_fresh_ai_cache(cache_payload):
+    generated_at = cache_payload.get("generated_at")
+    return isinstance(generated_at, (int, float)) and time.time() - generated_at < GEMINI_MIN_REFRESH_SECONDS
+
+
 def reserve_gemini_capacity(input_text):
-    tracker = get_gemini_usage_tracker()
     now = time.time()
     input_tokens = estimate_input_tokens(input_text)
+    request_log = read_json_file(GEMINI_REQUEST_LOG_PATH, [])
 
-    while tracker["minute"] and tracker["minute"][0][0] <= now - 60:
-        tracker["minute"].popleft()
-
-    while tracker["day"] and tracker["day"][0][0] <= now - 86400:
-        tracker["day"].popleft()
-
-    minute_requests = len(tracker["minute"])
-    minute_input_tokens = sum(tokens for _, tokens in tracker["minute"])
-    day_requests = len(tracker["day"])
+    request_log = [
+        entry for entry in request_log
+        if isinstance(entry, dict) and now - float(entry.get("ts", 0)) < 86400
+    ]
+    minute_log = [
+        entry for entry in request_log
+        if now - float(entry.get("ts", 0)) < 60
+    ]
+    minute_requests = len(minute_log)
+    minute_input_tokens = sum(int(entry.get("input_tokens", 0)) for entry in minute_log)
+    day_requests = len(request_log)
 
     if minute_requests + 1 > GEMINI_MAX_REQUESTS_PER_MINUTE:
         return "Gemini 사용량 제한: 분당 요청 수가 14회를 초과하지 않도록 이번 호출을 중단했습니다."
@@ -259,10 +309,14 @@ def reserve_gemini_capacity(input_text):
         return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
 
     if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
-        return "Gemini 사용량 제한: 일일 요청 수가 499회를 초과하지 않도록 이번 호출을 중단했습니다."
+        return "Gemini 사용량 제한: 일일 요청 수가 144회를 초과하지 않도록 이번 호출을 중단했습니다."
 
-    tracker["minute"].append((now, input_tokens))
-    tracker["day"].append((now, input_tokens))
+    request_log.append({
+        "ts": now,
+        "input_tokens": input_tokens,
+        "model": GEMINI_MODEL_NAME,
+    })
+    write_json_file(GEMINI_REQUEST_LOG_PATH, request_log)
     return None
 
 
@@ -833,16 +887,46 @@ def extract_gemini_text(response):
     return "\n".join(parts).strip()
 
 
-@st.cache_data(ttl=600)
 def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
+    cached_result = read_json_file(AI_RESULT_CACHE_PATH, {})
+
+    if (
+        isinstance(cached_result, dict)
+        and cached_result.get("cache_version") == cache_version
+        and cached_result.get("model") == GEMINI_MODEL_NAME
+        and cached_result.get("data")
+        and is_fresh_ai_cache(cached_result)
+    ):
+        return cached_result["data"]
+
+    if not api_key:
+        if isinstance(cached_result, dict) and cached_result.get("data"):
+            return cached_result["data"]
+        return {
+            "error": "GEMINI_API_KEY가 설정되지 않았고 저장된 AI 결과가 없습니다.",
+            "raw": None
+        }
+
+    if not acquire_refresh_lock():
+        if isinstance(cached_result, dict) and cached_result.get("data"):
+            return cached_result["data"]
+        return {
+            "error": "AI 결과를 갱신 중입니다. 잠시 후 다시 확인해주세요.",
+            "raw": None
+        }
+
     try:
         import google.generativeai as genai
 
-        if not api_key:
-            return {
-                "error": "GEMINI_API_KEY가 설정되지 않았습니다.",
-                "raw": None
-            }
+        cached_result = read_json_file(AI_RESULT_CACHE_PATH, {})
+        if (
+            isinstance(cached_result, dict)
+            and cached_result.get("cache_version") == cache_version
+            and cached_result.get("model") == GEMINI_MODEL_NAME
+            and cached_result.get("data")
+            and is_fresh_ai_cache(cached_result)
+        ):
+            return cached_result["data"]
 
         genai.configure(api_key=api_key)
 
@@ -859,6 +943,8 @@ def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
         prompt = build_ai_persona_prompt(news_data)
         limit_error = reserve_gemini_capacity(prompt)
         if limit_error:
+            if isinstance(cached_result, dict) and cached_result.get("data"):
+                return cached_result["data"]
             return {
                 "error": limit_error,
                 "raw": None
@@ -869,39 +955,32 @@ def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
         response_text = extract_gemini_text(response)
         parsed = parse_gemini_json(response_text)
 
-        if parsed is None and response_text:
-            repair_prompt = f"""
-아래 내용을 유효한 JSON 객체 하나로만 복구해라.
-설명, 마크다운, 코드블록, HTML은 절대 출력하지 마라.
-누락된 필드는 빈 문자열, 빈 배열, null 중 적절한 값으로 채워라.
-
-[복구할 내용]
-{response_text}
-"""
-            limit_error = reserve_gemini_capacity(repair_prompt)
-            if limit_error:
-                return {
-                    "error": limit_error,
-                    "raw": response_text
-                }
-
-            repair_response = model.generate_content(repair_prompt)
-            repair_text = extract_gemini_text(repair_response)
-            parsed = parse_gemini_json(repair_text)
-
         if parsed is None:
+            if isinstance(cached_result, dict) and cached_result.get("data"):
+                return cached_result["data"]
             return {
-                "error": "AI 응답을 JSON으로 파싱하지 못했습니다. 새로고침을 한 번 더 눌러주세요.",
+                "error": "AI 응답을 JSON으로 파싱하지 못했고 저장된 AI 결과가 없습니다.",
                 "raw": response_text
             }
 
-        return sanitize_ai_payload(parsed)
+        parsed = sanitize_ai_payload(parsed)
+        write_json_file(AI_RESULT_CACHE_PATH, {
+            "generated_at": time.time(),
+            "cache_version": cache_version,
+            "model": GEMINI_MODEL_NAME,
+            "data": parsed,
+        })
+        return parsed
 
     except Exception as e:
+        if isinstance(cached_result, dict) and cached_result.get("data"):
+            return cached_result["data"]
         return {
             "error": f"AI 인사이트를 생성하는 중 오류가 발생했습니다. API Key와 할당량을 확인해주세요. 상세: {e}",
             "raw": None
         }
+    finally:
+        release_refresh_lock()
 
 
 def render_ai_dashboard(ai_data):
@@ -1063,28 +1142,14 @@ with st.sidebar:
 
     if api_key:
         st.success("Gemini API Key가 서버 설정에서 적용되었습니다.")
-        manual_key = st.text_input(
-            "Gemini API Key 직접 덮어쓰기",
-            type="password",
-            value="",
-            help="비워두면 서버의 GEMINI_API_KEY를 사용합니다."
-        )
-        if manual_key.strip():
-            api_key = manual_key.strip()
     else:
         st.warning("서버에 GEMINI_API_KEY가 없습니다.")
-        api_key = st.text_input(
-            "Gemini API Key",
-            type="password",
-            help="서버에 GEMINI_API_KEY가 없을 때만 직접 입력하세요."
-        ).strip()
 
     st_autorefresh(interval=600 * 1000, limit=None, key="news_autorefresh")
 
     st.markdown("---")
 
     if st.button("🔄 최신 뉴스 새로고침", use_container_width=True):
-        st.cache_data.clear()
         st.rerun()
 
     tz_kst = pytz.timezone("Asia/Seoul")
@@ -1124,7 +1189,7 @@ else:
     st.markdown("<div class='insight-title'>💡 실시간 핵심 토픽 분석 No API</div>", unsafe_allow_html=True)
     st.markdown(
         "API 키가 입력되지 않아 **파이썬 로컬 자동 분석 모드**로 대체하여 보여줍니다. "
-        "좌측 메뉴에 API 키를 입력하거나 서버의 `.streamlit/secrets.toml`에 `GEMINI_API_KEY`를 설정하면 "
+        "서버의 `.streamlit/secrets.toml` 또는 환경변수에 `GEMINI_API_KEY`를 설정하면 "
         "Gemini가 **핵심 이슈 6개, 추천 기사, 우리가 놓친 기사들**을 분석합니다.",
         unsafe_allow_html=True
     )

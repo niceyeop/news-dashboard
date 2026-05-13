@@ -1132,29 +1132,8 @@ def render_local_missed_articles(news_data):
             )
 
 
-# =========================
-# 사이드바
-# =========================
 api_key = get_gemini_api_key()
-
-with st.sidebar:
-    st.header("⚙️ 대시보드 설정")
-
-    if api_key:
-        st.success("Gemini API Key가 서버 설정에서 적용되었습니다.")
-    else:
-        st.warning("서버에 GEMINI_API_KEY가 없습니다.")
-
-    st_autorefresh(interval=600 * 1000, limit=None, key="news_autorefresh")
-
-    st.markdown("---")
-
-    if st.button("🔄 최신 뉴스 새로고침", use_container_width=True):
-        st.rerun()
-
-    tz_kst = pytz.timezone("Asia/Seoul")
-    st.caption(f"마지막 업데이트:\n{datetime.now(tz_kst).strftime('%Y-%m-%d %H:%M:%S')} KST")
-    st.caption(f"모니터링 기준 언론사: {TARGET_PRESS}")
+st_autorefresh(interval=600 * 1000, limit=None, key="news_autorefresh")
 
 
 # =========================

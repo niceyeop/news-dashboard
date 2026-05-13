@@ -2,10 +2,13 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 from collections import Counter
+from contextlib import closing
 import re
 import json
 import html
 import os
+import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,9 +26,7 @@ GEMINI_MAX_REQUESTS_PER_MINUTE = 14
 GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
 GEMINI_MAX_REQUESTS_PER_DAY = 144
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
-AI_RESULT_CACHE_PATH = AI_CACHE_DIR / "ai_insight_cache.json"
-GEMINI_REQUEST_LOG_PATH = AI_CACHE_DIR / "gemini_request_log.json"
-AI_REFRESH_LOCK_PATH = AI_CACHE_DIR / "ai_refresh.lock"
+AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
 AI_REFRESH_LOCK_TTL_SECONDS = 120
 
 
@@ -236,48 +237,126 @@ def estimate_input_tokens(text):
     return max(1, len(str(text).encode("utf-8")) // 3)
 
 
-def read_json_file(path, default):
+def get_db_connection():
+    AI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(AI_DB_PATH), timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def init_ai_store():
+    with closing(get_db_connection()) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_cache (
+                cache_key TEXT PRIMARY KEY,
+                refresh_slot TEXT NOT NULL,
+                generated_at REAL NOT NULL,
+                cache_version TEXT NOT NULL,
+                model TEXT NOT NULL,
+                data_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_request_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                refresh_slot TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS slot_attempts (
+                refresh_slot TEXT PRIMARY KEY,
+                attempted_at REAL NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_locks (
+                lock_name TEXT PRIMARY KEY,
+                acquired_at REAL NOT NULL
+            )
+        """)
+
+
+def get_cached_ai_result():
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM ai_cache WHERE cache_key = 'latest'"
+        ).fetchone()
+
+    if not row:
+        return {}
+
     try:
-        if not path.exists():
-            return default
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(row["data_json"])
     except Exception:
-        return default
+        data = None
+
+    return {
+        "refresh_slot": row["refresh_slot"],
+        "generated_at": row["generated_at"],
+        "cache_version": row["cache_version"],
+        "model": row["model"],
+        "data": data,
+    }
 
 
-def write_json_file(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(path)
+def save_ai_result(refresh_slot, data, cache_version=AI_CACHE_VERSION):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_cache (
+                cache_key, refresh_slot, generated_at, cache_version, model, data_json
+            )
+            VALUES ('latest', ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                refresh_slot = excluded.refresh_slot,
+                generated_at = excluded.generated_at,
+                cache_version = excluded.cache_version,
+                model = excluded.model,
+                data_json = excluded.data_json
+            """,
+            (
+                refresh_slot,
+                time.time(),
+                cache_version,
+                GEMINI_MODEL_NAME,
+                json.dumps(data, ensure_ascii=False),
+            )
+        )
 
 
 def acquire_refresh_lock():
-    AI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    init_ai_store()
     now = time.time()
 
-    try:
-        if AI_REFRESH_LOCK_PATH.exists() and now - AI_REFRESH_LOCK_PATH.stat().st_mtime > AI_REFRESH_LOCK_TTL_SECONDS:
-            AI_REFRESH_LOCK_PATH.unlink()
-    except Exception:
-        pass
+    with closing(get_db_connection()) as conn:
+        conn.execute(
+            "DELETE FROM refresh_locks WHERE lock_name = 'ai_refresh' AND acquired_at < ?",
+            (now - AI_REFRESH_LOCK_TTL_SECONDS,)
+        )
 
-    try:
-        fd = os.open(str(AI_REFRESH_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
-            lock_file.write(str(now))
-        return True
-    except FileExistsError:
-        return False
+        try:
+            conn.execute(
+                "INSERT INTO refresh_locks (lock_name, acquired_at) VALUES ('ai_refresh', ?)",
+                (now,)
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def release_refresh_lock():
-    try:
-        AI_REFRESH_LOCK_PATH.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        conn.execute("DELETE FROM refresh_locks WHERE lock_name = 'ai_refresh'")
 
 
 def get_kst_now():
@@ -308,38 +387,69 @@ def is_fresh_ai_cache(cache_payload):
     return cache_payload.get("refresh_slot") == get_current_refresh_slot()
 
 
-def reserve_gemini_capacity(input_text):
+def was_slot_attempted(refresh_slot):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM slot_attempts WHERE refresh_slot = ?",
+            (refresh_slot,)
+        ).fetchone()
+    return row is not None
+
+
+def record_slot_attempt(refresh_slot, status, error=None):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        conn.execute(
+            """
+            INSERT INTO slot_attempts (refresh_slot, attempted_at, status, error)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(refresh_slot) DO UPDATE SET
+                attempted_at = excluded.attempted_at,
+                status = excluded.status,
+                error = excluded.error
+            """,
+            (refresh_slot, time.time(), status, error)
+        )
+
+
+def reserve_gemini_capacity(input_text, refresh_slot):
+    init_ai_store()
     now = time.time()
     input_tokens = estimate_input_tokens(input_text)
-    request_log = read_json_file(GEMINI_REQUEST_LOG_PATH, [])
 
-    request_log = [
-        entry for entry in request_log
-        if isinstance(entry, dict) and now - float(entry.get("ts", 0)) < 86400
-    ]
-    minute_log = [
-        entry for entry in request_log
-        if now - float(entry.get("ts", 0)) < 60
-    ]
-    minute_requests = len(minute_log)
-    minute_input_tokens = sum(int(entry.get("input_tokens", 0)) for entry in minute_log)
-    day_requests = len(request_log)
+    with closing(get_db_connection()) as conn:
+        conn.execute("DELETE FROM gemini_request_log WHERE ts < ?", (now - 86400,))
+        minute_requests = conn.execute(
+            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ?",
+            (now - 60,)
+        ).fetchone()[0]
+        minute_input_tokens = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) FROM gemini_request_log WHERE ts >= ?",
+            (now - 60,)
+        ).fetchone()[0]
+        day_requests = conn.execute(
+            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ?",
+            (now - 86400,)
+        ).fetchone()[0]
 
-    if minute_requests + 1 > GEMINI_MAX_REQUESTS_PER_MINUTE:
-        return "Gemini 사용량 제한: 분당 요청 수가 14회를 초과하지 않도록 이번 호출을 중단했습니다."
+        if minute_requests + 1 > GEMINI_MAX_REQUESTS_PER_MINUTE:
+            return "Gemini 사용량 제한: 분당 요청 수가 14회를 초과하지 않도록 이번 호출을 중단했습니다."
 
-    if minute_input_tokens + input_tokens > GEMINI_MAX_INPUT_TOKENS_PER_MINUTE:
-        return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
+        if minute_input_tokens + input_tokens > GEMINI_MAX_INPUT_TOKENS_PER_MINUTE:
+            return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
 
-    if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
-        return "Gemini 사용량 제한: 일일 요청 수가 144회를 초과하지 않도록 이번 호출을 중단했습니다."
+        if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
+            return "Gemini 사용량 제한: 일일 요청 수가 144회를 초과하지 않도록 이번 호출을 중단했습니다."
 
-    request_log.append({
-        "ts": now,
-        "input_tokens": input_tokens,
-        "model": GEMINI_MODEL_NAME,
-    })
-    write_json_file(GEMINI_REQUEST_LOG_PATH, request_log)
+        conn.execute(
+            """
+            INSERT INTO gemini_request_log (ts, input_tokens, model, refresh_slot)
+            VALUES (?, ?, ?, ?)
+            """,
+            (now, input_tokens, GEMINI_MODEL_NAME, refresh_slot)
+        )
+
     return None
 
 
@@ -555,8 +665,7 @@ def normalize_url(url):
     return url
 
 
-@st.cache_data
-def fetch_news(refresh_slot):
+def collect_news():
     results = {}
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -626,6 +735,11 @@ def fetch_news(refresh_slot):
             }]
 
     return results
+
+
+@st.cache_data
+def fetch_news(refresh_slot):
+    return collect_news()
 
 
 def flatten_news_titles(news_data):
@@ -910,38 +1024,28 @@ def extract_gemini_text(response):
     return "\n".join(parts).strip()
 
 
-def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
-    cached_result = read_json_file(AI_RESULT_CACHE_PATH, {})
-
-    if (
-        isinstance(cached_result, dict)
-        and cached_result.get("cache_version") == cache_version
-        and cached_result.get("model") == GEMINI_MODEL_NAME
-        and cached_result.get("data")
-        and is_fresh_ai_cache(cached_result)
-    ):
+def get_stored_ai_insight():
+    cached_result = get_cached_ai_result()
+    if isinstance(cached_result, dict) and cached_result.get("data"):
         return cached_result["data"]
 
-    if not api_key:
-        if isinstance(cached_result, dict) and cached_result.get("data"):
-            return cached_result["data"]
-        return {
-            "error": "GEMINI_API_KEY가 설정되지 않았고 저장된 AI 결과가 없습니다.",
-            "raw": None
-        }
+    return {
+        "error": "저장된 AI 분석 결과가 아직 없습니다. 다음 10분 갱신 후 표시됩니다.",
+        "raw": None
+    }
+
+
+def refresh_ai_for_slot(api_key, refresh_slot, cache_version=AI_CACHE_VERSION):
+    if not api_key or was_slot_attempted(refresh_slot):
+        return
 
     if not acquire_refresh_lock():
-        if isinstance(cached_result, dict) and cached_result.get("data"):
-            return cached_result["data"]
-        return {
-            "error": "AI 결과를 갱신 중입니다. 잠시 후 다시 확인해주세요.",
-            "raw": None
-        }
+        return
 
     try:
         import google.generativeai as genai
 
-        cached_result = read_json_file(AI_RESULT_CACHE_PATH, {})
+        cached_result = get_cached_ai_result()
         if (
             isinstance(cached_result, dict)
             and cached_result.get("cache_version") == cache_version
@@ -949,7 +1053,10 @@ def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
             and cached_result.get("data")
             and is_fresh_ai_cache(cached_result)
         ):
-            return cached_result["data"]
+            return
+
+        if was_slot_attempted(refresh_slot):
+            return
 
         genai.configure(api_key=api_key)
 
@@ -963,15 +1070,14 @@ def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
             }
         )
 
+        news_data = collect_news()
         prompt = build_ai_persona_prompt(news_data)
-        limit_error = reserve_gemini_capacity(prompt)
+        record_slot_attempt(refresh_slot, "running")
+
+        limit_error = reserve_gemini_capacity(prompt, refresh_slot)
         if limit_error:
-            if isinstance(cached_result, dict) and cached_result.get("data"):
-                return cached_result["data"]
-            return {
-                "error": limit_error,
-                "raw": None
-            }
+            record_slot_attempt(refresh_slot, "skipped", limit_error)
+            return
 
         response = model.generate_content(prompt)
 
@@ -979,32 +1085,43 @@ def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
         parsed = parse_gemini_json(response_text)
 
         if parsed is None:
-            if isinstance(cached_result, dict) and cached_result.get("data"):
-                return cached_result["data"]
-            return {
-                "error": "AI 응답을 JSON으로 파싱하지 못했고 저장된 AI 결과가 없습니다.",
-                "raw": response_text
-            }
+            record_slot_attempt(refresh_slot, "failed", "AI 응답을 JSON으로 파싱하지 못했습니다.")
+            return
 
         parsed = sanitize_ai_payload(parsed)
-        write_json_file(AI_RESULT_CACHE_PATH, {
-            "generated_at": time.time(),
-            "refresh_slot": get_current_refresh_slot(),
-            "cache_version": cache_version,
-            "model": GEMINI_MODEL_NAME,
-            "data": parsed,
-        })
-        return parsed
+        save_ai_result(refresh_slot, parsed, cache_version)
+        record_slot_attempt(refresh_slot, "success")
 
     except Exception as e:
-        if isinstance(cached_result, dict) and cached_result.get("data"):
-            return cached_result["data"]
-        return {
-            "error": f"AI 인사이트를 생성하는 중 오류가 발생했습니다. API Key와 할당량을 확인해주세요. 상세: {e}",
-            "raw": None
-        }
+        record_slot_attempt(refresh_slot, "failed", str(e))
     finally:
         release_refresh_lock()
+
+
+def seconds_until_next_refresh_slot():
+    return milliseconds_until_next_refresh_slot() / 1000
+
+
+def ai_refresh_scheduler_worker(api_key):
+    while True:
+        time.sleep(max(1, seconds_until_next_refresh_slot() + 1))
+        refresh_ai_for_slot(api_key, get_current_refresh_slot(), AI_CACHE_VERSION)
+
+
+@st.cache_resource
+def start_ai_refresh_scheduler(api_key):
+    init_ai_store()
+    if not api_key:
+        return False
+
+    thread = threading.Thread(
+        target=ai_refresh_scheduler_worker,
+        args=(api_key,),
+        daemon=True,
+        name="news-dashboard-ai-refresh",
+    )
+    thread.start()
+    return True
 
 
 def render_ai_dashboard(ai_data):
@@ -1158,6 +1275,7 @@ def render_local_missed_articles(news_data):
 
 api_key = get_gemini_api_key()
 refresh_slot = get_current_refresh_slot()
+start_ai_refresh_scheduler(api_key)
 st_autorefresh(interval=milliseconds_until_next_refresh_slot(), limit=None, key="news_autorefresh")
 
 
@@ -1185,8 +1303,8 @@ if api_key:
         unsafe_allow_html=True
     )
 
-    with st.spinner("Gemini 3.1 Flash Lite가 핵심 이슈 6개와 우리가 놓친 기사를 분석하고 있습니다..."):
-        ai_insight = generate_ai_insight(news_data, api_key, AI_CACHE_VERSION)
+    with st.spinner("저장된 AI 분석 결과를 불러오고 있습니다..."):
+        ai_insight = get_stored_ai_insight()
         render_ai_dashboard(ai_insight)
 
 else:

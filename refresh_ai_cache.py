@@ -17,7 +17,7 @@ GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
 GEMINI_MAX_REQUESTS_PER_MINUTE = 14
 GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
-GEMINI_MAX_REQUESTS_PER_DAY = 144
+GEMINI_MAX_REQUESTS_PER_DAY = 499
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
 AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
 AI_REFRESH_LOCK_TTL_SECONDS = 120
@@ -161,14 +161,27 @@ def release_refresh_lock():
         conn.execute("DELETE FROM refresh_locks WHERE lock_name = 'ai_refresh'")
 
 
-def was_slot_attempted(refresh_slot):
+def get_slot_attempt(refresh_slot):
     init_ai_store()
     with closing(get_db_connection()) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM slot_attempts WHERE refresh_slot = ?",
+        return conn.execute(
+            "SELECT status, attempted_at, error FROM slot_attempts WHERE refresh_slot = ?",
             (refresh_slot,),
         ).fetchone()
-    return row is not None
+
+
+def should_skip_slot(refresh_slot):
+    row = get_slot_attempt(refresh_slot)
+    if not row:
+        return False
+
+    if row["status"] in {"success", "cached", "skipped"}:
+        return True
+
+    if row["status"] == "running":
+        return time.time() - float(row["attempted_at"]) < AI_REFRESH_LOCK_TTL_SECONDS
+
+    return False
 
 
 def record_slot_attempt(refresh_slot, status, error=None):
@@ -272,7 +285,7 @@ def reserve_gemini_capacity(input_text, refresh_slot):
             return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
 
         if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
-            return "Gemini 사용량 제한: KST 일일 요청 수가 144회를 초과하지 않도록 이번 호출을 중단했습니다."
+            return "Gemini 사용량 제한: KST 일일 요청 수가 499회를 초과하지 않도록 이번 호출을 중단했습니다."
 
         conn.execute(
             """
@@ -564,8 +577,8 @@ def refresh_ai_for_current_slot():
         print("GEMINI_API_KEY is not configured.")
         return 1
 
-    if was_slot_attempted(refresh_slot):
-        print(f"Slot already attempted: {refresh_slot}")
+    if should_skip_slot(refresh_slot):
+        print(f"Slot already completed or currently running: {refresh_slot}")
         return 0
 
     if not acquire_refresh_lock():

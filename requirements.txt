@@ -1,0 +1,5 @@
+streamlit
+streamlit-autorefresh
+requests
+beautifulsoup4
+google-generativeai

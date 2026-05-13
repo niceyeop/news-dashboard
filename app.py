@@ -8,11 +8,9 @@ import json
 import html
 import os
 import sqlite3
-import threading
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
-import pytz
+from zoneinfo import ZoneInfo
 from streamlit_autorefresh import st_autorefresh
 
 # 페이지 설정
@@ -22,12 +20,8 @@ TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
-GEMINI_MAX_REQUESTS_PER_MINUTE = 14
-GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
-GEMINI_MAX_REQUESTS_PER_DAY = 144
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
 AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
-AI_REFRESH_LOCK_TTL_SECONDS = 120
 
 
 # =========================
@@ -214,29 +208,6 @@ def escape_card_safe_text(value, fallback=""):
     return html.escape(strip_embedded_card_text(value, fallback=fallback))
 
 
-def get_gemini_api_key():
-    """
-    1순위: Streamlit secrets.toml
-    2순위: 환경변수 GEMINI_API_KEY
-    3순위: 빈 값
-    """
-    key = ""
-
-    try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:
-        key = ""
-
-    if not key:
-        key = os.getenv("GEMINI_API_KEY", "")
-
-    return key.strip() if key else ""
-
-
-def estimate_input_tokens(text):
-    return max(1, len(str(text).encode("utf-8")) // 3)
-
-
 def get_db_connection():
     AI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(AI_DB_PATH), timeout=30, isolation_level=None)
@@ -256,29 +227,6 @@ def init_ai_store():
                 cache_version TEXT NOT NULL,
                 model TEXT NOT NULL,
                 data_json TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gemini_request_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                model TEXT NOT NULL,
-                refresh_slot TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS slot_attempts (
-                refresh_slot TEXT PRIMARY KEY,
-                attempted_at REAL NOT NULL,
-                status TEXT NOT NULL,
-                error TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS refresh_locks (
-                lock_name TEXT PRIMARY KEY,
-                acquired_at REAL NOT NULL
             )
         """)
 
@@ -307,60 +255,8 @@ def get_cached_ai_result():
     }
 
 
-def save_ai_result(refresh_slot, data, cache_version=AI_CACHE_VERSION):
-    init_ai_store()
-    with closing(get_db_connection()) as conn:
-        conn.execute(
-            """
-            INSERT INTO ai_cache (
-                cache_key, refresh_slot, generated_at, cache_version, model, data_json
-            )
-            VALUES ('latest', ?, ?, ?, ?, ?)
-            ON CONFLICT(cache_key) DO UPDATE SET
-                refresh_slot = excluded.refresh_slot,
-                generated_at = excluded.generated_at,
-                cache_version = excluded.cache_version,
-                model = excluded.model,
-                data_json = excluded.data_json
-            """,
-            (
-                refresh_slot,
-                time.time(),
-                cache_version,
-                GEMINI_MODEL_NAME,
-                json.dumps(data, ensure_ascii=False),
-            )
-        )
-
-
-def acquire_refresh_lock():
-    init_ai_store()
-    now = time.time()
-
-    with closing(get_db_connection()) as conn:
-        conn.execute(
-            "DELETE FROM refresh_locks WHERE lock_name = 'ai_refresh' AND acquired_at < ?",
-            (now - AI_REFRESH_LOCK_TTL_SECONDS,)
-        )
-
-        try:
-            conn.execute(
-                "INSERT INTO refresh_locks (lock_name, acquired_at) VALUES ('ai_refresh', ?)",
-                (now,)
-            )
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def release_refresh_lock():
-    init_ai_store()
-    with closing(get_db_connection()) as conn:
-        conn.execute("DELETE FROM refresh_locks WHERE lock_name = 'ai_refresh'")
-
-
 def get_kst_now():
-    return datetime.now(pytz.timezone("Asia/Seoul"))
+    return datetime.now(ZoneInfo("Asia/Seoul"))
 
 
 def get_current_refresh_slot():
@@ -381,76 +277,6 @@ def milliseconds_until_next_refresh_slot():
 
     milliseconds = int((next_slot - now).total_seconds() * 1000)
     return max(milliseconds, 1000)
-
-
-def is_fresh_ai_cache(cache_payload):
-    return cache_payload.get("refresh_slot") == get_current_refresh_slot()
-
-
-def was_slot_attempted(refresh_slot):
-    init_ai_store()
-    with closing(get_db_connection()) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM slot_attempts WHERE refresh_slot = ?",
-            (refresh_slot,)
-        ).fetchone()
-    return row is not None
-
-
-def record_slot_attempt(refresh_slot, status, error=None):
-    init_ai_store()
-    with closing(get_db_connection()) as conn:
-        conn.execute(
-            """
-            INSERT INTO slot_attempts (refresh_slot, attempted_at, status, error)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(refresh_slot) DO UPDATE SET
-                attempted_at = excluded.attempted_at,
-                status = excluded.status,
-                error = excluded.error
-            """,
-            (refresh_slot, time.time(), status, error)
-        )
-
-
-def reserve_gemini_capacity(input_text, refresh_slot):
-    init_ai_store()
-    now = time.time()
-    input_tokens = estimate_input_tokens(input_text)
-
-    with closing(get_db_connection()) as conn:
-        conn.execute("DELETE FROM gemini_request_log WHERE ts < ?", (now - 86400,))
-        minute_requests = conn.execute(
-            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ?",
-            (now - 60,)
-        ).fetchone()[0]
-        minute_input_tokens = conn.execute(
-            "SELECT COALESCE(SUM(input_tokens), 0) FROM gemini_request_log WHERE ts >= ?",
-            (now - 60,)
-        ).fetchone()[0]
-        day_requests = conn.execute(
-            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ?",
-            (now - 86400,)
-        ).fetchone()[0]
-
-        if minute_requests + 1 > GEMINI_MAX_REQUESTS_PER_MINUTE:
-            return "Gemini 사용량 제한: 분당 요청 수가 14회를 초과하지 않도록 이번 호출을 중단했습니다."
-
-        if minute_input_tokens + input_tokens > GEMINI_MAX_INPUT_TOKENS_PER_MINUTE:
-            return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
-
-        if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
-            return "Gemini 사용량 제한: 일일 요청 수가 144회를 초과하지 않도록 이번 호출을 중단했습니다."
-
-        conn.execute(
-            """
-            INSERT INTO gemini_request_log (ts, input_tokens, model, refresh_slot)
-            VALUES (?, ?, ?, ?)
-            """,
-            (now, input_tokens, GEMINI_MODEL_NAME, refresh_slot)
-        )
-
-    return None
 
 
 # =========================
@@ -1003,129 +829,15 @@ def parse_gemini_json(text):
     return None
 
 
-def extract_gemini_text(response):
-    text = getattr(response, "text", "")
-
-    if text:
-        return text
-
-    parts = []
-
-    try:
-        for candidate in getattr(response, "candidates", []) or []:
-            content = getattr(candidate, "content", None)
-            for part in getattr(content, "parts", []) or []:
-                part_text = getattr(part, "text", "")
-                if part_text:
-                    parts.append(part_text)
-    except Exception:
-        pass
-
-    return "\n".join(parts).strip()
-
-
 def get_stored_ai_insight():
     cached_result = get_cached_ai_result()
     if isinstance(cached_result, dict) and cached_result.get("data"):
         return cached_result["data"]
 
     return {
-        "error": "저장된 AI 분석 결과를 생성 중입니다. 잠시 후 새로고침하면 표시됩니다.",
+        "error": "저장된 AI 분석 결과가 아직 없습니다. 별도 스케줄러가 DB를 갱신한 뒤 표시됩니다.",
         "raw": None
     }
-
-
-def refresh_ai_for_slot(api_key, refresh_slot, cache_version=AI_CACHE_VERSION):
-    if not api_key or was_slot_attempted(refresh_slot):
-        return
-
-    if not acquire_refresh_lock():
-        return
-
-    try:
-        import google.generativeai as genai
-
-        cached_result = get_cached_ai_result()
-        if (
-            isinstance(cached_result, dict)
-            and cached_result.get("cache_version") == cache_version
-            and cached_result.get("model") == GEMINI_MODEL_NAME
-            and cached_result.get("data")
-            and is_fresh_ai_cache(cached_result)
-        ):
-            return
-
-        if was_slot_attempted(refresh_slot):
-            return
-
-        genai.configure(api_key=api_key)
-
-        model = genai.GenerativeModel(
-            GEMINI_MODEL_NAME,
-            generation_config={
-                "temperature": 0.25,
-                "top_p": 0.8,
-                "max_output_tokens": 12000,
-                "response_mime_type": "application/json"
-            }
-        )
-
-        news_data = collect_news()
-        prompt = build_ai_persona_prompt(news_data)
-        record_slot_attempt(refresh_slot, "running")
-
-        limit_error = reserve_gemini_capacity(prompt, refresh_slot)
-        if limit_error:
-            record_slot_attempt(refresh_slot, "skipped", limit_error)
-            return
-
-        response = model.generate_content(prompt)
-
-        response_text = extract_gemini_text(response)
-        parsed = parse_gemini_json(response_text)
-
-        if parsed is None:
-            record_slot_attempt(refresh_slot, "failed", "AI 응답을 JSON으로 파싱하지 못했습니다.")
-            return
-
-        parsed = sanitize_ai_payload(parsed)
-        save_ai_result(refresh_slot, parsed, cache_version)
-        record_slot_attempt(refresh_slot, "success")
-
-    except Exception as e:
-        record_slot_attempt(refresh_slot, "failed", str(e))
-    finally:
-        release_refresh_lock()
-
-
-def seconds_until_next_refresh_slot():
-    return milliseconds_until_next_refresh_slot() / 1000
-
-
-def ai_refresh_scheduler_worker(api_key):
-    while True:
-        time.sleep(max(1, seconds_until_next_refresh_slot() + 1))
-        refresh_ai_for_slot(api_key, get_current_refresh_slot(), AI_CACHE_VERSION)
-
-
-@st.cache_resource
-def start_ai_refresh_scheduler(api_key):
-    init_ai_store()
-    if not api_key:
-        return False
-
-    cached_result = get_cached_ai_result()
-    if not (isinstance(cached_result, dict) and cached_result.get("data")):
-        refresh_ai_for_slot(api_key, get_current_refresh_slot(), AI_CACHE_VERSION)
-
-    thread = threading.Thread(
-        target=ai_refresh_scheduler_worker,
-        args=(api_key,),
-        daemon=True,
-        name="news-dashboard-ai-refresh",
-    )
-    thread.start()
-    return True
 
 
 def render_ai_dashboard(ai_data):
@@ -1277,9 +989,7 @@ def render_local_missed_articles(news_data):
             )
 
 
-api_key = get_gemini_api_key()
 refresh_slot = get_current_refresh_slot()
-start_ai_refresh_scheduler(api_key)
 st_autorefresh(interval=milliseconds_until_next_refresh_slot(), limit=None, key="news_autorefresh")
 
 
@@ -1301,45 +1011,14 @@ with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
 # =========================
 st.markdown("<div class='insight-box'>", unsafe_allow_html=True)
 
-if api_key:
-    st.markdown(
-        "<div class='insight-title'>💡 AI 에디터의 뉴스 트렌드 분석</div>",
-        unsafe_allow_html=True
-    )
+st.markdown(
+    "<div class='insight-title'>💡 AI 에디터의 뉴스 트렌드 분석</div>",
+    unsafe_allow_html=True
+)
 
-    with st.spinner("저장된 AI 분석 결과를 불러오고 있습니다..."):
-        ai_insight = get_stored_ai_insight()
-        render_ai_dashboard(ai_insight)
-
-else:
-    st.markdown("<div class='insight-title'>💡 실시간 핵심 토픽 분석 No API</div>", unsafe_allow_html=True)
-    st.markdown(
-        "API 키가 입력되지 않아 **파이썬 로컬 자동 분석 모드**로 대체하여 보여줍니다. "
-        "서버의 `.streamlit/secrets.toml` 또는 환경변수에 `GEMINI_API_KEY`를 설정하면 "
-        "Gemini가 **핵심 이슈 6개, 추천 기사, 우리가 놓친 기사들**을 분석합니다.",
-        unsafe_allow_html=True
-    )
-    st.write("")
-
-    issues = analyze_issues(news_data, top_n=3)
-
-    if not issues:
-        st.markdown("현재 충분한 뉴스 데이터를 수집하지 못했습니다.")
-    else:
-        cols = st.columns(3)
-
-        for idx, issue in enumerate(issues):
-            with cols[idx]:
-                st.markdown(
-                    f"<h3 style='color: #a8e6cf;'>🔥 #{idx + 1} {html.escape(str(issue['keyword']))} "
-                    f"<span style='font-size: 1rem; color: #e0e0e0;'>({html.escape(str(issue['count']))}건)</span></h3>",
-                    unsafe_allow_html=True
-                )
-
-                for title in issue["titles"]:
-                    st.markdown(f"- {title}")
-
-    render_local_missed_articles(news_data)
+with st.spinner("저장된 AI 분석 결과를 불러오고 있습니다..."):
+    ai_insight = get_stored_ai_insight()
+    render_ai_dashboard(ai_insight)
 
 st.markdown("</div>", unsafe_allow_html=True)
 

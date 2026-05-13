@@ -1,10 +1,12 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from collections import Counter
+from collections import Counter, deque
 import re
 import json
 import html
+import os
+import time
 from datetime import datetime
 import pytz
 from streamlit_autorefresh import st_autorefresh
@@ -13,8 +15,260 @@ from streamlit_autorefresh import st_autorefresh
 st.set_page_config(page_title="주요 언론사 뉴스 대시보드", page_icon="📰", layout="wide")
 
 TARGET_PRESS = "국민일보"
+AI_CACHE_VERSION = "minimal-fields-v1"
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+GEMINI_MAX_REQUESTS_PER_MINUTE = 14
+GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
+GEMINI_MAX_REQUESTS_PER_DAY = 499
 
-# 프리미엄 디자인 적용
+
+# =========================
+# 유틸 함수
+# =========================
+def clean_model_text(text):
+    """
+    Gemini 응답에 코드블록이나 불필요한 마크다운이 섞였을 때 정리합니다.
+    """
+    if not text:
+        return ""
+
+    cleaned = str(text).strip()
+    cleaned = re.sub(r"^```json", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```html", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    return cleaned
+
+
+def is_probably_html(text):
+    if not text:
+        return False
+
+    t = html.unescape(str(text)).strip().lower()
+    html_signals = ["<div", "<span", "<p", "<br", "<small", "<a ", "<ul", "<li", "<section"]
+    return any(signal in t for signal in html_signals)
+
+
+def to_plain_display_text(value, prefer_after_label=None):
+    """
+    AI가 JSON 필드 안에 HTML 카드 조각을 넣어도 화면에는 일반 텍스트만 보이게 합니다.
+    """
+    if value is None:
+        return ""
+
+    text = html.unescape(clean_model_text(value))
+    cut_points = [
+        pos for pos in [
+            text.lower().find("<div"),
+            text.lower().find("&lt;div"),
+            text.find("```"),
+        ]
+        if pos != -1
+    ]
+    if cut_points:
+        text = text[:min(cut_points)]
+
+    if is_probably_html(text) or re.search(r"</?[a-z][\s\S]*?>", text, flags=re.IGNORECASE):
+        soup = BeautifulSoup(text, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+
+    text = re.sub(r"```(?:html|json)?", "", str(text), flags=re.IGNORECASE)
+    text = text.replace("```", "")
+    text = re.sub(r"</?[a-z][^>]*?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if prefer_after_label and prefer_after_label in text:
+        text = text.split(prefer_after_label, 1)[1].strip()
+
+    return text
+
+
+def strip_embedded_card_text(value, fallback=""):
+    """
+    AI가 텍스트 필드에 대시보드 HTML 카드 전체를 넣은 경우 본문에 노출하지 않습니다.
+    """
+    text = to_plain_display_text(value)
+    card_markers = [
+        "중요도",
+        "확산성",
+        "관심도",
+        "신선도",
+        "추천 노출 기사",
+        "score-badge",
+        "recommended-box",
+    ]
+
+    original = html.unescape(str(value or ""))
+
+    if is_probably_html(original) or any(marker in text for marker in card_markers):
+        if "편집 코멘트:" in text:
+            return text.split("편집 코멘트:", 1)[1].strip()
+        if any(marker in text for marker in card_markers):
+            return fallback
+
+    return text
+
+
+def has_embedded_markup(value):
+    text = html.unescape(str(value or "")).lower()
+    markup_markers = [
+        "<div",
+        "</div",
+        "<span",
+        "</span",
+        "<p",
+        "</p",
+        "<br",
+        "<small",
+        "</small",
+        "<a ",
+        "</a",
+        "```",
+        "score-badge",
+        "recommended-box",
+        "class=",
+        "target='_blank'",
+        'target="_blank"',
+    ]
+    return any(marker in text for marker in markup_markers)
+
+
+def sanitize_ai_text(value, fallback=""):
+    text = strip_embedded_card_text(value, fallback=fallback)
+    if has_embedded_markup(text):
+        return fallback
+    return text
+
+
+def sanitize_ai_payload(ai_data):
+    if not isinstance(ai_data, dict):
+        return ai_data
+
+    summary = ai_data.get("dashboard_summary")
+    if isinstance(summary, dict):
+        for key in ["overall_trend", "editorial_note"]:
+            summary[key] = sanitize_ai_text(summary.get(key, ""))
+
+        clean_keywords = []
+        for keyword in summary.get("top_keywords", []) or []:
+            clean_keyword = sanitize_ai_text(keyword)
+            if clean_keyword:
+                clean_keywords.append(clean_keyword)
+        summary["top_keywords"] = clean_keywords
+
+    for issue in ai_data.get("issues", []) or []:
+        if not isinstance(issue, dict):
+            continue
+
+        for key in ["issue_title", "category", "one_line_summary", "why_it_matters", "editor_comment"]:
+            issue[key] = sanitize_ai_text(issue.get(key, ""))
+
+        recommended = issue.get("recommended_article")
+        if isinstance(recommended, dict):
+            for key in ["media", "title", "reason"]:
+                recommended[key] = sanitize_ai_text(recommended.get(key, ""))
+
+        clean_related = []
+        for article in issue.get("related_articles", []) or []:
+            if not isinstance(article, dict):
+                continue
+            article["media"] = sanitize_ai_text(article.get("media", ""))
+            article["title"] = sanitize_ai_text(article.get("title", ""))
+            clean_related.append(article)
+        issue["related_articles"] = clean_related
+
+    for item in ai_data.get("missed_articles", []) or []:
+        if not isinstance(item, dict):
+            continue
+
+        for key in ["issue_title", "category", "why_missed", "coverage_signal", "suggested_angle"]:
+            item[key] = sanitize_ai_text(item.get(key, ""))
+
+        clean_refs = []
+        for article in item.get("reference_articles", []) or []:
+            if not isinstance(article, dict):
+                continue
+            article["media"] = sanitize_ai_text(article.get("media", ""))
+            article["title"] = sanitize_ai_text(article.get("title", ""))
+            clean_refs.append(article)
+        item["reference_articles"] = clean_refs
+
+    return ai_data
+
+
+def escape_display_text(value, prefer_after_label=None):
+    return html.escape(to_plain_display_text(value, prefer_after_label=prefer_after_label))
+
+
+def escape_card_safe_text(value, fallback=""):
+    return html.escape(strip_embedded_card_text(value, fallback=fallback))
+
+
+def get_gemini_api_key():
+    """
+    1순위: Streamlit secrets.toml
+    2순위: 환경변수 GEMINI_API_KEY
+    3순위: 빈 값
+    """
+    key = ""
+
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        key = ""
+
+    if not key:
+        key = os.getenv("GEMINI_API_KEY", "")
+
+    return key.strip() if key else ""
+
+
+@st.cache_resource
+def get_gemini_usage_tracker():
+    return {
+        "minute": deque(),
+        "day": deque(),
+    }
+
+
+def estimate_input_tokens(text):
+    return max(1, len(str(text).encode("utf-8")) // 3)
+
+
+def reserve_gemini_capacity(input_text):
+    tracker = get_gemini_usage_tracker()
+    now = time.time()
+    input_tokens = estimate_input_tokens(input_text)
+
+    while tracker["minute"] and tracker["minute"][0][0] <= now - 60:
+        tracker["minute"].popleft()
+
+    while tracker["day"] and tracker["day"][0][0] <= now - 86400:
+        tracker["day"].popleft()
+
+    minute_requests = len(tracker["minute"])
+    minute_input_tokens = sum(tokens for _, tokens in tracker["minute"])
+    day_requests = len(tracker["day"])
+
+    if minute_requests + 1 > GEMINI_MAX_REQUESTS_PER_MINUTE:
+        return "Gemini 사용량 제한: 분당 요청 수가 14회를 초과하지 않도록 이번 호출을 중단했습니다."
+
+    if minute_input_tokens + input_tokens > GEMINI_MAX_INPUT_TOKENS_PER_MINUTE:
+        return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
+
+    if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
+        return "Gemini 사용량 제한: 일일 요청 수가 499회를 초과하지 않도록 이번 호출을 중단했습니다."
+
+    tracker["minute"].append((now, input_tokens))
+    tracker["day"].append((now, input_tokens))
+    return None
+
+
+# =========================
+# CSS
+# =========================
 st.markdown("""
 <style>
     .insight-box {
@@ -193,7 +447,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# =========================
 # 주요 언론사 네이버 채널 URL
+# =========================
 URLS = {
     "국민일보": "https://media.naver.com/press/005",
     "조선일보": "https://media.naver.com/press/023",
@@ -224,16 +480,6 @@ def normalize_url(url):
 
 @st.cache_data(ttl=600)
 def fetch_news():
-    """
-    언론사별 주요 뉴스 제목과 URL을 수집합니다.
-    반환 형식:
-    {
-        "국민일보": [
-            {"title": "기사 제목", "url": "https://..."},
-            ...
-        ]
-    }
-    """
     results = {}
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -248,7 +494,6 @@ def fetch_news():
 
             articles = []
 
-            # 1차: 네이버 언론사 채널 주요 제목 셀렉터
             title_nodes = soup.select(".press_news_text")
 
             for node in title_nodes:
@@ -265,7 +510,6 @@ def fetch_news():
                         "url": article_url
                     })
 
-            # 2차: 예비 셀렉터
             if not articles:
                 title_nodes = soup.select(".cjs_t")
 
@@ -283,7 +527,6 @@ def fetch_news():
                             "url": article_url
                         })
 
-            # 3차: 링크 기반 보조 수집
             if not articles:
                 link_nodes = soup.select("a[href*='/article/']")
 
@@ -321,7 +564,6 @@ def flatten_news_titles(news_data):
 
 
 def analyze_issues(news_data, top_n=3):
-    """API 없이 파이썬 로컬 텍스트 분석으로 핵심 토픽을 자동 군집화합니다."""
     all_titles = flatten_news_titles(news_data)
 
     stopwords = set([
@@ -362,10 +604,6 @@ def analyze_issues(news_data, top_n=3):
 
 
 def analyze_missed_articles_local(news_data, target_press=TARGET_PRESS, top_n=3):
-    """
-    API 없이 간단히 '다른 언론에는 있는데 국민일보에는 상대적으로 덜 보이는 키워드'를 탐지합니다.
-    정확한 이슈 클러스터링은 Gemini 사용 시 더 정교하게 작동합니다.
-    """
     target_articles = news_data.get(target_press, [])
     target_titles = [
         a.get("title", "")
@@ -405,7 +643,6 @@ def analyze_missed_articles_local(news_data, target_press=TARGET_PRESS, top_n=3)
 
         for w in clean_title.split():
             if len(w) > 1 and w not in stopwords and not w.isdigit():
-                # 국민일보 제목에 없는 키워드만 후보로
                 if w not in target_text:
                     words.append(w)
 
@@ -434,9 +671,6 @@ def analyze_missed_articles_local(news_data, target_press=TARGET_PRESS, top_n=3)
 
 
 def build_ai_persona_prompt(news_data):
-    """
-    Gemini 2.5 Flash Lite에 주입할 뉴스 분석 페르소나 프롬프트입니다.
-    """
     input_articles = []
 
     for press, articles in news_data.items():
@@ -463,96 +697,22 @@ def build_ai_persona_prompt(news_data):
 다른 주요 언론사들은 다루고 있는데 {TARGET_PRESS}의 현재 주요 뉴스 목록에는 보이지 않는 이슈를 찾아
 〈우리가 놓친 기사들〉 항목으로 제안해야 한다.
 
-너는 단순 요약봇이 아니다.
-너는 뉴스 편집자, 트렌드 분석가, 추천 알고리즘, 경쟁지 모니터링 에디터의 역할을 동시에 수행한다.
-
-분석 대상은 기사 제목, 언론사명, URL이다.
-기사 본문은 제공되지 않는다.
-따라서 기사 제목에 없는 사실을 임의로 추정하거나 단정해서는 안 된다.
-
-핵심 이슈 분석 기준은 다음과 같다.
-
-1. 이슈 집중도
-- 여러 언론사에서 반복적으로 다루는 주제인가?
-- 비슷한 사건, 인물, 기관, 키워드가 여러 기사 제목에서 반복되는가?
-- 같은 이슈가 정치, 경제, 사회 등 여러 관점으로 확장되고 있는가?
-
-2. 시의성
-- 현재 시점에서 막 발생했거나 오늘의 주요 흐름을 보여주는가?
-- 속보성, 긴급성, 업데이트 가능성이 있는가?
-
-3. 사회적 파급력
-- 국민 생활, 정책, 경제, 안보, 재난, 사건사고, 사법, 국제 정세 등에 영향이 큰가?
-- 단순 화제성보다 실제 영향력이 큰 이슈를 우선한다.
-
-4. 독자 관심도
-- 대중이 클릭하거나 알고 싶어 할 가능성이 높은가?
-- 유명 인물, 논란, 갈등, 금전, 안전, 부동산, 정치 이벤트, 범죄, 재난, 생활 정보 등 관심 요소가 있는가?
-
-5. 뉴스 가치
-- 공공성, 영향성, 갈등성, 의외성, 근접성, 유명성, 지속성을 기준으로 판단한다.
-- 단순 자극적 제목이나 낚시성 제목은 과대평가하지 않는다.
-
-6. 중복 제거
-- 같은 사건을 다룬 여러 기사는 하나의 이슈로 묶는다.
-- 표현만 다르고 본질이 같은 기사는 중복 이슈로 분리하지 않는다.
-- 단, 같은 사건이라도 정치적 파장, 경제적 영향, 사회적 논란이 명확히 다르면 하위 관점으로 구분할 수 있다.
-
-추천 기사 기준은 다음과 같다.
-
-1. 제목만 봐도 이슈가 명확히 드러나는 기사
-2. 지나치게 자극적이지 않으면서도 클릭 동기가 있는 기사
-3. 핵심 사실, 주요 인물, 갈등 구조가 잘 드러나는 기사
-4. 여러 언론사가 다룬 이슈라면 가장 대표성이 높은 제목
-5. 동일 이슈 내에서 중복 기사가 많을 경우 가장 정보량이 많은 제목
-6. 이용자에게 지금 보여줄 가치가 높은 기사
-
-〈우리가 놓친 기사들〉 분석 기준은 다음과 같다.
-
-- 기준 언론사는 반드시 "{TARGET_PRESS}"다.
-- "{TARGET_PRESS}"의 기사 목록에 없는 이슈 중, 다른 언론사 여러 곳에서 반복적으로 등장하는 이슈를 우선 제안한다.
-- 단순히 제목 표현이 다를 뿐 같은 이슈를 {TARGET_PRESS}가 이미 다루고 있다면 "놓친 기사"로 분류하지 않는다.
-- 다른 언론 1곳만 다룬 단독성 기사보다, 여러 언론이 동시에 다룬 공통 이슈를 우선한다.
-- 정치, 경제, 사회, 사건사고, 국제, 생활 영향이 큰 이슈를 우선한다.
-- 연예, 스포츠, 단순 화제성 이슈는 중요도가 높지 않으면 후순위로 둔다.
-- 제안 시에는 "{TARGET_PRESS}가 어떤 앵글로 다루면 좋은지"를 반드시 포함한다.
-- 참고 기사는 반드시 입력 기사 목록에 있는 타 언론 기사만 사용한다.
-
-주의사항:
-- 기사 제목에 없는 세부 사실을 만들어내지 마라.
-- 특정 정치 성향이나 언론사 관점을 편들지 마라.
-- 제목이 모호하면 "제목 기준 추정"이라고 표시하라.
-- 루머, 의혹, 단독 보도는 확정 사실처럼 표현하지 마라.
-- 추천 기사는 반드시 입력된 기사 목록 안에서만 선택하라.
-- 기사 본문을 읽은 것처럼 말하지 마라.
-- 결과는 한국어로 작성하라.
+중요:
+- 기사 본문은 제공되지 않는다.
+- 기사 제목에 없는 사실을 임의로 추정하거나 단정하지 마라.
+- 결과는 반드시 JSON만 출력하라.
+- HTML, Markdown, 코드블록을 절대 출력하지 마라.
+- JSON 앞뒤에 설명 문장을 붙이지 마라.
+- 어떤 문자열 값에도 <div>, <span>, <p>, <br>, <a>, class=, ``` 같은 HTML/Markdown 조각을 넣지 마라.
+- 중요도, 확산성, 관심도, 신선도는 반드시 scores 객체 안의 숫자로만 넣고 본문 문자열에는 반복하지 마라.
+- 추천 기사 제목, 언론사, URL, 추천 이유는 반드시 recommended_article 객체 필드에만 나누어 넣어라.
 
 카테고리는 반드시 아래 중 하나만 사용하라.
 정치, 경제, 사회, 국제, 생활, IT·과학, 문화, 스포츠, 연예, 오피니언, 기타
 
 점수는 1점부터 5점까지 정수로 부여하라.
-- 5점: 매우 높음
-- 4점: 높음
-- 3점: 보통
-- 2점: 낮음
-- 1점: 매우 낮음
-
-내부적으로 다음 순서로 판단하라.
-1단계: 기사 제목에서 핵심 키워드, 인물, 기관, 사건명을 추출한다.
-2단계: 유사한 제목을 같은 이슈로 클러스터링한다.
-3단계: 각 클러스터의 기사 수, 언론사 수, 시의성, 파급력을 평가한다.
-4단계: 중복 이슈를 제거한다.
-5단계: 핵심 이슈 6개를 중요도 순으로 정렬한다.
-6단계: 각 이슈에서 가장 대표적인 노출 추천 기사를 1개 선정한다.
-7단계: {TARGET_PRESS} 기사 목록과 타 언론 기사 목록을 비교한다.
-8단계: 타 언론에는 반복 등장하지만 {TARGET_PRESS}에는 없는 이슈를 〈우리가 놓친 기사들〉로 정리한다.
-9단계: 대시보드에 보여줄 전체 흐름 요약과 키워드를 생성한다.
-
-단, 위 사고 과정은 출력하지 말고 최종 결과만 출력하라.
 
 반드시 아래 JSON 형식으로만 출력하라.
-마크다운 코드블록을 사용하지 마라.
-JSON 외의 설명 문장을 출력하지 마라.
 
 {{
   "dashboard_summary": {{
@@ -627,69 +787,115 @@ JSON 외의 설명 문장을 출력하지 마라.
 
 
 def parse_gemini_json(text):
-    """
-    Gemini 응답에서 JSON을 안전하게 파싱합니다.
-    혹시 코드블록이 섞여도 최대한 복구합니다.
-    """
     if not text:
         return None
 
-    cleaned = text.strip()
-
-    cleaned = re.sub(r"^```json", "", cleaned)
-    cleaned = re.sub(r"^```", "", cleaned)
-    cleaned = re.sub(r"```$", "", cleaned)
-    cleaned = cleaned.strip()
+    cleaned = clean_model_text(text)
 
     try:
         return json.loads(cleaned)
     except Exception:
         pass
 
-    try:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
 
-        if start != -1 and end != -1 and end > start:
-            return json.loads(cleaned[start:end + 1])
-    except Exception:
-        return None
+    if start != -1 and end != -1 and end > start:
+        json_candidate = cleaned[start:end + 1]
+        json_candidate = re.sub(r",\s*([}\]])", r"\1", json_candidate)
+
+        try:
+            return json.loads(json_candidate)
+        except Exception:
+            pass
 
     return None
 
 
-def generate_ai_insight(news_data, api_key):
-    """
-    Gemini API를 이용한 실시간 AI 인사이트 도출.
-    페르소나를 주입하고 JSON 구조로 결과를 받습니다.
-    """
+def extract_gemini_text(response):
+    text = getattr(response, "text", "")
+
+    if text:
+        return text
+
+    parts = []
+
+    try:
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", "")
+                if part_text:
+                    parts.append(part_text)
+    except Exception:
+        pass
+
+    return "\n".join(parts).strip()
+
+
+@st.cache_data(ttl=600)
+def generate_ai_insight(news_data, api_key, cache_version=AI_CACHE_VERSION):
     try:
         import google.generativeai as genai
+
+        if not api_key:
+            return {
+                "error": "GEMINI_API_KEY가 설정되지 않았습니다.",
+                "raw": None
+            }
 
         genai.configure(api_key=api_key)
 
         model = genai.GenerativeModel(
-            "gemini-2.5-flash-lite",
+            GEMINI_MODEL_NAME,
             generation_config={
                 "temperature": 0.25,
                 "top_p": 0.8,
-                "max_output_tokens": 6500,
+                "max_output_tokens": 12000,
                 "response_mime_type": "application/json"
             }
         )
 
         prompt = build_ai_persona_prompt(news_data)
+        limit_error = reserve_gemini_capacity(prompt)
+        if limit_error:
+            return {
+                "error": limit_error,
+                "raw": None
+            }
+
         response = model.generate_content(prompt)
 
-        parsed = parse_gemini_json(response.text)
+        response_text = extract_gemini_text(response)
+        parsed = parse_gemini_json(response_text)
+
+        if parsed is None and response_text:
+            repair_prompt = f"""
+아래 내용을 유효한 JSON 객체 하나로만 복구해라.
+설명, 마크다운, 코드블록, HTML은 절대 출력하지 마라.
+누락된 필드는 빈 문자열, 빈 배열, null 중 적절한 값으로 채워라.
+
+[복구할 내용]
+{response_text}
+"""
+            limit_error = reserve_gemini_capacity(repair_prompt)
+            if limit_error:
+                return {
+                    "error": limit_error,
+                    "raw": response_text
+                }
+
+            repair_response = model.generate_content(repair_prompt)
+            repair_text = extract_gemini_text(repair_response)
+            parsed = parse_gemini_json(repair_text)
 
         if parsed is None:
             return {
-                "error": "AI 응답을 JSON으로 파싱하지 못했습니다.",
-                "raw": response.text
+                "error": "AI 응답을 JSON으로 파싱하지 못했습니다. 새로고침을 한 번 더 눌러주세요.",
+                "raw": response_text
             }
 
-        return parsed
+        return sanitize_ai_payload(parsed)
 
     except Exception as e:
         return {
@@ -701,35 +907,59 @@ def generate_ai_insight(news_data, api_key):
 def render_ai_dashboard(ai_data):
     """
     Gemini가 생성한 JSON 결과를 Streamlit 대시보드에 렌더링합니다.
+    혹시 문자열 HTML이 들어오더라도 코드로 보이지 않게 보정합니다.
     """
     if not ai_data:
         st.warning("AI 분석 결과가 없습니다.")
         return
 
+    if isinstance(ai_data, str):
+        cleaned = clean_model_text(ai_data)
+
+        parsed = parse_gemini_json(cleaned)
+        if parsed:
+            render_ai_dashboard(parsed)
+        else:
+            st.warning("AI 응답 형식이 올바르지 않아 표시하지 않았습니다. 새로고침을 눌러 다시 분석해주세요.")
+        return
+
+    if not isinstance(ai_data, dict):
+        st.warning("AI 분석 결과 형식이 올바르지 않습니다.")
+        return
+
+    ai_data = sanitize_ai_payload(ai_data)
+
     if ai_data.get("error"):
         st.error(ai_data["error"])
 
-        if ai_data.get("raw"):
+        raw = ai_data.get("raw")
+        if raw:
+            raw_cleaned = clean_model_text(raw)
+
             with st.expander("AI 원문 응답 보기"):
-                st.text(ai_data["raw"])
+                if is_probably_html(raw_cleaned):
+                    st.write(strip_embedded_card_text(raw_cleaned, fallback="AI가 HTML 형식으로 응답했습니다. 새로고침을 눌러 다시 분석해주세요."))
+                else:
+                    st.code(raw_cleaned, language="json")
 
         return
 
-    summary = ai_data.get("dashboard_summary", {})
-    issues = ai_data.get("issues", [])
-    missed_articles = ai_data.get("missed_articles", [])
+    summary = ai_data.get("dashboard_summary", {}) or {}
+    issues = ai_data.get("issues", []) or []
+    missed_articles = ai_data.get("missed_articles", []) or []
 
     overall_trend = summary.get("overall_trend", "")
     top_keywords = summary.get("top_keywords", [])
     editorial_note = summary.get("editorial_note", "")
+    top_keywords_text = ", ".join([escape_display_text(k) for k in top_keywords])
 
     st.markdown(
         f"""
         <div class="summary-card">
             <h3>📌 오늘의 전체 뉴스 흐름</h3>
-            <p>{html.escape(overall_trend)}</p>
-            <p><b>핵심 키워드:</b> {", ".join([html.escape(str(k)) for k in top_keywords])}</p>
-            <p><b>편집 코멘트:</b> {html.escape(editorial_note)}</p>
+            <p>{escape_display_text(overall_trend)}</p>
+            <p><b>핵심 키워드:</b> {top_keywords_text}</p>
+            <p><b>편집 코멘트:</b> {escape_card_safe_text(editorial_note)}</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -743,75 +973,23 @@ def render_ai_dashboard(ai_data):
         with cols[idx % 2]:
             rank = issue.get("rank", idx + 1)
             issue_title = issue.get("issue_title", "이슈명 없음")
-            category = issue.get("category", "기타")
             one_line_summary = issue.get("one_line_summary", "")
             why_it_matters = issue.get("why_it_matters", "")
-            recommended = issue.get("recommended_article", {}) or {}
-            scores = issue.get("scores", {}) or {}
-            editor_comment = issue.get("editor_comment", "")
-
-            rec_media = recommended.get("media", "")
-            rec_title = recommended.get("title", "")
-            rec_url = recommended.get("url")
-            rec_reason = recommended.get("reason", "")
-
-            importance = scores.get("importance", "-")
-            virality = scores.get("virality", "-")
-            reader_interest = scores.get("reader_interest", "-")
-            freshness = scores.get("freshness", "-")
-
-            rec_link_html = html.escape(rec_title)
-
-            if rec_url:
-                rec_link_html = f"<a href='{html.escape(str(rec_url))}' target='_blank'>{html.escape(rec_title)}</a>"
 
             st.markdown(
                 f"""
                 <div class="issue-card">
-                    <div class="issue-rank">#{rank}</div>
-                    <div class="issue-title">{html.escape(issue_title)}</div>
-                    <div class="issue-category">{html.escape(category)}</div>
-                    <p><b>요약:</b> {html.escape(one_line_summary)}</p>
-                    <p><b>중요한 이유:</b> {html.escape(why_it_matters)}</p>
-
-                    <div>
-                        <span class="score-badge">중요도 {importance}</span>
-                        <span class="score-badge">확산성 {virality}</span>
-                        <span class="score-badge">관심도 {reader_interest}</span>
-                        <span class="score-badge">신선도 {freshness}</span>
-                    </div>
-
-                    <div class="recommended-box">
-                        <b>✅ 추천 노출 기사</b><br>
-                        <small>{html.escape(rec_media)}</small><br>
-                        {rec_link_html}<br>
-                        <small>{html.escape(rec_reason)}</small>
-                    </div>
-
-                    <p style="margin-top:12px;"><b>편집 코멘트:</b> {html.escape(editor_comment)}</p>
+                    <div class="issue-rank">#{escape_display_text(rank)}</div>
+                    <div class="issue-title">{escape_display_text(issue_title)}</div>
+                    <p><b>요약:</b> {escape_card_safe_text(one_line_summary)}</p>
+                    <p><b>중요한 이유:</b> {escape_card_safe_text(why_it_matters)}</p>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            related_articles = issue.get("related_articles", [])
-
-            with st.expander(f"관련 기사 보기 - {issue_title}"):
-                if related_articles:
-                    for article in related_articles:
-                        media = article.get("media", "")
-                        title = article.get("title", "")
-                        url = article.get("url")
-
-                        if url:
-                            st.markdown(f"- [{media}] [{title}]({url})")
-                        else:
-                            st.markdown(f"- [{media}] {title}")
-                else:
-                    st.caption("관련 기사 정보가 없습니다.")
-
     st.markdown("---")
-    st.markdown(f"### 🧭 우리가 놓친 기사들")
+    st.markdown("### 🧭 우리가 놓친 기사들")
     st.caption(f"기준: {TARGET_PRESS} 주요 뉴스 목록에 없지만 타 언론에서 반복적으로 다루는 이슈")
 
     if not missed_articles:
@@ -824,52 +1002,23 @@ def render_ai_dashboard(ai_data):
         with missed_cols[idx % 2]:
             rank = item.get("rank", idx + 1)
             issue_title = item.get("issue_title", "이슈명 없음")
-            category = item.get("category", "기타")
             why_missed = item.get("why_missed", "")
             coverage_signal = item.get("coverage_signal", "")
-            suggested_angle = item.get("suggested_angle", "")
-            urgency_score = item.get("urgency_score", "-")
 
             st.markdown(
                 f"""
                 <div class="missed-card">
-                    <div class="missed-rank">#{rank} 놓친 후보</div>
-                    <div class="issue-title">{html.escape(issue_title)}</div>
-                    <div class="missed-badge">{html.escape(category)}</div>
-                    <p><b>판단 이유:</b> {html.escape(why_missed)}</p>
-                    <p><b>타 언론 보도 신호:</b> {html.escape(coverage_signal)}</p>
-                    <span class="urgency-badge">긴급도 {urgency_score}</span>
-
-                    <div class="missed-recommend-box">
-                        <b>📝 국민일보 추천 앵글</b><br>
-                        {html.escape(suggested_angle)}
-                    </div>
+                    <div class="missed-rank">#{escape_display_text(rank)} 놓친 후보</div>
+                    <div class="issue-title">{escape_display_text(issue_title)}</div>
+                    <p><b>판단 이유:</b> {escape_card_safe_text(why_missed)}</p>
+                    <p><b>타 언론 보도 신호:</b> {escape_card_safe_text(coverage_signal)}</p>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            reference_articles = item.get("reference_articles", [])
-
-            with st.expander(f"참고 기사 보기 - {issue_title}"):
-                if reference_articles:
-                    for article in reference_articles:
-                        media = article.get("media", "")
-                        title = article.get("title", "")
-                        url = article.get("url")
-
-                        if url:
-                            st.markdown(f"- [{media}] [{title}]({url})")
-                        else:
-                            st.markdown(f"- [{media}] {title}")
-                else:
-                    st.caption("참고 기사 정보가 없습니다.")
-
 
 def render_local_missed_articles(news_data):
-    """
-    API 키가 없을 때 로컬 방식으로 우리가 놓친 기사 후보를 표시합니다.
-    """
     missed = analyze_missed_articles_local(news_data, TARGET_PRESS, top_n=3)
 
     st.markdown("---")
@@ -894,41 +1043,41 @@ def render_local_missed_articles(news_data):
                     border-left:6px solid #ff9800;
                     min-height:230px;
                 ">
-                    <div style="font-weight:800;color:#e07b00;">#{item['rank']} 놓친 후보</div>
-                    <h3>{html.escape(item['issue_title'])}</h3>
-                    <p><b>판단:</b> {html.escape(item['why_missed'])}</p>
-                    <p><b>신호:</b> {html.escape(item['coverage_signal'])}</p>
-                    <p><b>제안:</b> {html.escape(item['suggested_angle'])}</p>
+                    <div style="font-weight:800;color:#e07b00;">#{escape_display_text(item['rank'])} 놓친 후보</div>
+                    <h3>{escape_display_text(item['issue_title'])}</h3>
+                    <p><b>판단 이유:</b> {escape_card_safe_text(item['why_missed'])}</p>
+                    <p><b>타 언론 보도 신호:</b> {escape_card_safe_text(item['coverage_signal'])}</p>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            with st.expander(f"참고 기사 - {item['issue_title']}"):
-                refs = item.get("reference_articles", [])
-                if refs:
-                    for ref in refs:
-                        media = ref.get("media", "")
-                        title = ref.get("title", "")
-                        url = ref.get("url")
 
-                        if url:
-                            st.markdown(f"- [{media}] [{title}]({url})")
-                        else:
-                            st.markdown(f"- [{media}] {title}")
-                else:
-                    st.caption("참고 기사 정보가 없습니다.")
+# =========================
+# 사이드바
+# =========================
+api_key = get_gemini_api_key()
 
-
-# --- 사이드바 설정 ---
 with st.sidebar:
     st.header("⚙️ 대시보드 설정")
 
-    api_key = st.text_input(
-        "Gemini API Key 선택사항",
-        type="password",
-        help="API 키를 입력하면 Gemini 2.5 Flash Lite가 실시간 뉴스를 심층 분석합니다."
-    )
+    if api_key:
+        st.success("Gemini API Key가 서버 설정에서 적용되었습니다.")
+        manual_key = st.text_input(
+            "Gemini API Key 직접 덮어쓰기",
+            type="password",
+            value="",
+            help="비워두면 서버의 GEMINI_API_KEY를 사용합니다."
+        )
+        if manual_key.strip():
+            api_key = manual_key.strip()
+    else:
+        st.warning("서버에 GEMINI_API_KEY가 없습니다.")
+        api_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            help="서버에 GEMINI_API_KEY가 없을 때만 직접 입력하세요."
+        ).strip()
 
     st_autorefresh(interval=600 * 1000, limit=None, key="news_autorefresh")
 
@@ -943,36 +1092,40 @@ with st.sidebar:
     st.caption(f"모니터링 기준 언론사: {TARGET_PRESS}")
 
 
-# --- 메인 화면 ---
+# =========================
+# 메인 화면
+# =========================
 st.title("📰 뉴스 트렌드 & 인사이트 대시보드")
 st.markdown(
     f"주요 언론사 네이버 채널의 실시간 주요 뉴스와 핵심 인사이트를 한눈에 파악하세요. "
     f"현재 〈우리가 놓친 기사들〉 기준 언론사는 **{TARGET_PRESS}**입니다."
 )
 
-# 뉴스 데이터 로드
 with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
     news_data = fetch_news()
 
 
-# --- 1. 인사이트 섹션 ---
+# =========================
+# 인사이트 섹션
+# =========================
 st.markdown("<div class='insight-box'>", unsafe_allow_html=True)
 
 if api_key:
     st.markdown(
-        f"<div class='insight-title'>💡 Gemini 2.5 Flash Lite 뉴스 트렌드 에디터 분석</div>",
+        "<div class='insight-title'>💡 AI 에디터의 뉴스 트렌드 분석</div>",
         unsafe_allow_html=True
     )
 
-    with st.spinner("Gemini 2.5 Flash Lite가 핵심 이슈 6개와 우리가 놓친 기사를 분석하고 있습니다..."):
-        ai_insight = generate_ai_insight(news_data, api_key)
+    with st.spinner("Gemini 3.1 Flash Lite가 핵심 이슈 6개와 우리가 놓친 기사를 분석하고 있습니다..."):
+        ai_insight = generate_ai_insight(news_data, api_key, AI_CACHE_VERSION)
         render_ai_dashboard(ai_insight)
 
 else:
     st.markdown("<div class='insight-title'>💡 실시간 핵심 토픽 분석 No API</div>", unsafe_allow_html=True)
     st.markdown(
         "API 키가 입력되지 않아 **파이썬 로컬 자동 분석 모드**로 대체하여 보여줍니다. "
-        "좌측 메뉴에 API 키를 입력하면 Gemini가 **핵심 이슈 6개, 추천 기사, 우리가 놓친 기사들**을 분석합니다.",
+        "좌측 메뉴에 API 키를 입력하거나 서버의 `.streamlit/secrets.toml`에 `GEMINI_API_KEY`를 설정하면 "
+        "Gemini가 **핵심 이슈 6개, 추천 기사, 우리가 놓친 기사들**을 분석합니다.",
         unsafe_allow_html=True
     )
     st.write("")
@@ -987,8 +1140,8 @@ else:
         for idx, issue in enumerate(issues):
             with cols[idx]:
                 st.markdown(
-                    f"<h3 style='color: #a8e6cf;'>🔥 #{idx + 1} {html.escape(issue['keyword'])} "
-                    f"<span style='font-size: 1rem; color: #e0e0e0;'>({issue['count']}건)</span></h3>",
+                    f"<h3 style='color: #a8e6cf;'>🔥 #{idx + 1} {html.escape(str(issue['keyword']))} "
+                    f"<span style='font-size: 1rem; color: #e0e0e0;'>({html.escape(str(issue['count']))}건)</span></h3>",
                     unsafe_allow_html=True
                 )
 
@@ -1000,7 +1153,9 @@ else:
 st.markdown("</div>", unsafe_allow_html=True)
 
 
-# --- 2. 각 언론사별 주요뉴스 박스 ---
+# =========================
+# 언론사별 주요뉴스
+# =========================
 st.subheader("📰 언론사별 주요 뉴스")
 st.write("")
 
@@ -1018,7 +1173,7 @@ for idx, press in enumerate(press_names):
 
         html_content = (
             f"<div class='news-box{target_class}'>"
-            f"<div class='press-title'>{html.escape(press)}{target_label}</div>"
+            f"<div class='press-title'>{html.escape(str(press))}{target_label}</div>"
         )
 
         if not articles or "데이터를 불러올 수 없습니다" in articles[0].get("title", ""):
@@ -1028,7 +1183,7 @@ for idx, press in enumerate(press_names):
                 title = article.get("title", "")
                 url = article.get("url")
 
-                safe_title = html.escape(title)
+                safe_title = html.escape(str(title))
 
                 if url:
                     safe_url = html.escape(str(url))

@@ -3,6 +3,7 @@ set -euo pipefail
 
 : "${APP_DIR:?APP_DIR is required}"
 : "${REPO_URL:?REPO_URL is required}"
+BRANCH="${BRANCH:-main}"
 
 if [ ! -d "$APP_DIR/.git" ]; then
   mkdir -p "$APP_DIR"
@@ -10,8 +11,8 @@ if [ ! -d "$APP_DIR/.git" ]; then
 fi
 
 cd "$APP_DIR"
-git fetch origin main
-git reset --hard origin/main
+git fetch origin "$BRANCH"
+git reset --hard "origin/$BRANCH"
 
 if [ ! -d ".venv" ]; then
   python3 -m venv .venv

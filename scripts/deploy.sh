@@ -6,6 +6,9 @@ set -euo pipefail
 BRANCH="${BRANCH:-main}"
 
 if [ ! -d "$APP_DIR/.git" ]; then
+  if [ -d "$APP_DIR" ] && [ "$(ls -A "$APP_DIR" 2>/dev/null)" ]; then
+    mv "$APP_DIR" "${APP_DIR}_backup_$(date +%Y%m%d%H%M%S)"
+  fi
   mkdir -p "$APP_DIR"
   git clone "$REPO_URL" "$APP_DIR"
 fi

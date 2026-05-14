@@ -1055,15 +1055,15 @@ st_autorefresh(interval=UI_POLL_INTERVAL_MS, limit=None, key="news_autorefresh")
 # =========================
 st.title("📰 뉴스 트렌드 & 인사이트 대시보드")
 st.markdown(
-    f"주요 언론사 네이버 채널의 실시간 주요 뉴스와 핵심 인사이트를 한눈에 파악하세요. "
-    f"현재 〈우리가 놓친 기사들〉 기준 언론사는 **{TARGET_PRESS}**입니다."
+    f"주요 언론사의 네이버 뉴스 제목을 바탕으로 현재 뉴스 흐름과 AI 분석 결과를 한 화면에서 확인합니다. "
+    f"기준 매체는 **{TARGET_PRESS}**입니다."
 )
 
 dashboard_stats = get_dashboard_stats()
 metric_cols = st.columns(3)
-metric_cols[0].metric("??? ?? ??", format_timestamp(dashboard_stats["last_generated_at"]))
-metric_cols[1].metric("?? AI ?? ??", f"{dashboard_stats['today_ai_calls']} / 144")
-metric_cols[2].metric("??? ?? ??", dashboard_stats["last_refresh_slot"] or "-")
+metric_cols[0].metric("마지막 분석 시간", format_timestamp(dashboard_stats["last_generated_at"]))
+metric_cols[1].metric("오늘 AI 호출 횟수", f"{dashboard_stats['today_ai_calls']} / 144")
+metric_cols[2].metric("마지막 분석 슬롯", dashboard_stats["last_refresh_slot"] or "-")
 
 with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
     news_data = fetch_news(refresh_slot)
@@ -1075,7 +1075,7 @@ with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
 st.markdown("<div class='insight-box'>", unsafe_allow_html=True)
 
 st.markdown(
-    "<div class='insight-title'>💡 AI 에디터의 뉴스 트렌드 분석</div>",
+    "<div class='insight-title'>🧠 AI 에디터의 뉴스 트렌드 분석</div>",
     unsafe_allow_html=True
 )
 
@@ -1087,7 +1087,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 
 # =========================
-# 언론사별 주요뉴스
+# 언론사별 주요 뉴스
 # =========================
 st.subheader("📰 언론사별 주요 뉴스")
 st.write("")

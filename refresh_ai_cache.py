@@ -18,6 +18,8 @@ REFRESH_INTERVAL_MINUTES = 10
 GEMINI_MAX_REQUESTS_PER_MINUTE = 14
 GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
 GEMINI_MAX_REQUESTS_PER_DAY = 144
+SERVICE_UNAVAILABLE_THRESHOLD = 2
+SERVICE_UNAVAILABLE_COOLDOWN_SECONDS = 30 * 60
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
 AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
 AI_REFRESH_LOCK_TTL_SECONDS = 120
@@ -171,11 +173,37 @@ def set_scheduler_state(state_key, state_value):
         )
 
 
+def clear_scheduler_state(state_key):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        conn.execute("DELETE FROM scheduler_state WHERE state_key = ?", (state_key,))
+
+
 def get_daily_quota_block_reason():
     blocked_day = get_scheduler_state("quota_blocked_day")
     if blocked_day != get_kst_day_key():
         return ""
     return get_scheduler_state("quota_block_reason")
+
+
+def get_service_unavailable_cooldown_reason():
+    until_raw = get_scheduler_state("service_unavailable_until_ts")
+    if not until_raw:
+        return ""
+
+    try:
+        until_ts = float(until_raw)
+    except Exception:
+        clear_scheduler_state("service_unavailable_until_ts")
+        clear_scheduler_state("service_unavailable_reason")
+        return ""
+
+    if until_ts <= time.time():
+        clear_scheduler_state("service_unavailable_until_ts")
+        clear_scheduler_state("service_unavailable_reason")
+        return ""
+
+    return get_scheduler_state("service_unavailable_reason")
 
 
 def cleanup_expired_store():
@@ -641,6 +669,47 @@ def build_daily_quota_block_reason(exc):
     )
 
 
+def is_service_unavailable_error(exc):
+    message = str(exc).lower()
+    return "503" in message or "service unavailable" in message
+
+
+def record_service_unavailable_and_maybe_cooldown(exc):
+    current_count_raw = get_scheduler_state("service_unavailable_count")
+    try:
+        current_count = int(current_count_raw or "0")
+    except Exception:
+        current_count = 0
+
+    new_count = current_count + 1
+    set_scheduler_state("service_unavailable_count", str(new_count))
+
+    first_line = str(exc).splitlines()[0].strip()
+    if new_count < SERVICE_UNAVAILABLE_THRESHOLD:
+        return (
+            f"Gemini 503 장애 감지: 연속 {new_count}회 발생. "
+            f"원인: {first_line}"
+        )
+
+    until_ts = time.time() + SERVICE_UNAVAILABLE_COOLDOWN_SECONDS
+    until_text = datetime.fromtimestamp(
+        until_ts, ZoneInfo("Asia/Seoul")
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    reason = (
+        f"Gemini 503 장애가 연속 {new_count}회 발생해 "
+        f"{until_text} KST까지 추가 호출을 건너뜁니다. 원인: {first_line}"
+    )
+    set_scheduler_state("service_unavailable_until_ts", str(until_ts))
+    set_scheduler_state("service_unavailable_reason", reason)
+    return reason
+
+
+def clear_service_unavailable_state():
+    clear_scheduler_state("service_unavailable_count")
+    clear_scheduler_state("service_unavailable_until_ts")
+    clear_scheduler_state("service_unavailable_reason")
+
+
 def refresh_ai_for_current_slot():
     cleanup_expired_store()
     refresh_slot = get_current_refresh_slot()
@@ -654,6 +723,12 @@ def refresh_ai_for_current_slot():
     if daily_quota_block_reason:
         record_slot_attempt(refresh_slot, "skipped", daily_quota_block_reason)
         print(daily_quota_block_reason)
+        return 0
+
+    service_unavailable_cooldown_reason = get_service_unavailable_cooldown_reason()
+    if service_unavailable_cooldown_reason:
+        record_slot_attempt(refresh_slot, "skipped", service_unavailable_cooldown_reason)
+        print(service_unavailable_cooldown_reason)
         return 0
 
     if should_skip_slot(refresh_slot):
@@ -710,6 +785,7 @@ def refresh_ai_for_current_slot():
             return 1
 
         save_ai_result(refresh_slot, sanitize_ai_payload(parsed))
+        clear_service_unavailable_state()
         record_slot_attempt(refresh_slot, "success")
         print(f"AI cache refreshed for slot: {refresh_slot}")
         return 0
@@ -720,6 +796,11 @@ def refresh_ai_for_current_slot():
             set_scheduler_state("quota_block_reason", quota_reason)
             record_slot_attempt(refresh_slot, "skipped", quota_reason)
             print(quota_reason)
+            return 0
+        if is_service_unavailable_error(exc):
+            cooldown_reason = record_service_unavailable_and_maybe_cooldown(exc)
+            record_slot_attempt(refresh_slot, "skipped", cooldown_reason)
+            print(cooldown_reason)
             return 0
         record_slot_attempt(refresh_slot, "failed", str(exc))
         print(f"AI cache refresh failed: {exc}")

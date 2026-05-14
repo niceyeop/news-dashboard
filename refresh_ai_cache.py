@@ -13,16 +13,43 @@ from zoneinfo import ZoneInfo
 
 TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
-GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+PRIMARY_MODEL_NAME = "gemini-3.1-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
-GEMINI_MAX_REQUESTS_PER_MINUTE = 14
-GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
-GEMINI_MAX_REQUESTS_PER_DAY = 144
 SERVICE_UNAVAILABLE_THRESHOLD = 2
 SERVICE_UNAVAILABLE_COOLDOWN_SECONDS = 30 * 60
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
 AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
 AI_REFRESH_LOCK_TTL_SECONDS = 120
+
+MODEL_CHAIN = [
+    {
+        "provider": "gemini",
+        "model": "gemini-3.1-flash-lite",
+        "api_keys": ["GEMINI_API_KEY"],
+        "rpm": 14,
+        "rpd": 144,
+        "tpm": 240_000,
+        "tpd": None,
+    },
+    {
+        "provider": "groq",
+        "model": "llama-3.3-70b-versatile",
+        "api_keys": ["GROQ_API_KEY", "LLAMA_API_KEY"],
+        "rpm": 30,
+        "rpd": 1_000,
+        "tpm": 12_000,
+        "tpd": 100_000,
+    },
+    {
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",
+        "api_keys": ["GROQ_API_KEY", "GPT_OSS_API_KEY"],
+        "rpm": 30,
+        "rpd": 1_000,
+        "tpm": 8_000,
+        "tpd": 200_000,
+    },
+]
 
 
 URLS = {
@@ -43,8 +70,8 @@ URLS = {
 }
 
 
-def get_gemini_api_key():
-    key = os.getenv("GEMINI_API_KEY", "")
+def get_secret_value(secret_name):
+    key = os.getenv(secret_name, "")
     if key:
         return key.strip()
 
@@ -56,9 +83,17 @@ def get_gemini_api_key():
         import tomllib
 
         secrets = tomllib.loads(secrets_path.read_text(encoding="utf-8"))
-        return str(secrets.get("GEMINI_API_KEY", "")).strip()
+        return str(secrets.get(secret_name, "")).strip()
     except Exception:
         return ""
+
+
+def get_api_key_for_model(model_config):
+    for secret_name in model_config.get("api_keys", []):
+        value = get_secret_value(secret_name)
+        if value:
+            return value
+    return ""
 
 
 def get_db_connection():
@@ -148,6 +183,11 @@ def get_kst_day_key():
     return get_kst_now().strftime("%Y-%m-%d")
 
 
+def model_state_key(model_name, suffix):
+    slug = re.sub(r"[^a-z0-9]+", "_", model_name.lower()).strip("_")
+    return f"{slug}::{suffix}"
+
+
 def get_scheduler_state(state_key):
     init_ai_store()
     with closing(get_db_connection()) as conn:
@@ -179,31 +219,33 @@ def clear_scheduler_state(state_key):
         conn.execute("DELETE FROM scheduler_state WHERE state_key = ?", (state_key,))
 
 
-def get_daily_quota_block_reason():
-    blocked_day = get_scheduler_state("quota_blocked_day")
+def get_daily_quota_block_reason(model_name):
+    blocked_day = get_scheduler_state(model_state_key(model_name, "quota_blocked_day"))
     if blocked_day != get_kst_day_key():
         return ""
-    return get_scheduler_state("quota_block_reason")
+    return get_scheduler_state(model_state_key(model_name, "quota_block_reason"))
 
 
-def get_service_unavailable_cooldown_reason():
-    until_raw = get_scheduler_state("service_unavailable_until_ts")
+def get_service_unavailable_cooldown_reason(model_name):
+    until_key = model_state_key(model_name, "service_unavailable_until_ts")
+    reason_key = model_state_key(model_name, "service_unavailable_reason")
+    until_raw = get_scheduler_state(until_key)
     if not until_raw:
         return ""
 
     try:
         until_ts = float(until_raw)
     except Exception:
-        clear_scheduler_state("service_unavailable_until_ts")
-        clear_scheduler_state("service_unavailable_reason")
+        clear_scheduler_state(until_key)
+        clear_scheduler_state(reason_key)
         return ""
 
     if until_ts <= time.time():
-        clear_scheduler_state("service_unavailable_until_ts")
-        clear_scheduler_state("service_unavailable_reason")
+        clear_scheduler_state(until_key)
+        clear_scheduler_state(reason_key)
         return ""
 
-    return get_scheduler_state("service_unavailable_reason")
+    return get_scheduler_state(reason_key)
 
 
 def cleanup_expired_store():
@@ -310,7 +352,7 @@ def is_fresh_ai_cache(cache_payload, refresh_slot):
     return cache_payload.get("refresh_slot") == refresh_slot
 
 
-def save_ai_result(refresh_slot, data):
+def save_ai_result(refresh_slot, data, model_name):
     init_ai_store()
     with closing(get_db_connection()) as conn:
         conn.execute(
@@ -330,7 +372,7 @@ def save_ai_result(refresh_slot, data):
                 refresh_slot,
                 time.time(),
                 AI_CACHE_VERSION,
-                GEMINI_MODEL_NAME,
+                model_name,
                 json.dumps(data, ensure_ascii=False),
             ),
         )
@@ -340,42 +382,54 @@ def estimate_input_tokens(text):
     return max(1, len(str(text).encode("utf-8")) // 3)
 
 
-def reserve_gemini_capacity(input_text, refresh_slot):
+def reserve_model_capacity(input_text, refresh_slot, model_config):
     init_ai_store()
     now = time.time()
     input_tokens = estimate_input_tokens(input_text)
     day_start, day_end = kst_day_bounds()
+    model_name = model_config["model"]
+    model_rpm = int(model_config["rpm"])
+    model_rpd = int(model_config["rpd"])
+    model_tpm = int(model_config["tpm"])
+    model_tpd = model_config.get("tpd")
 
     with closing(get_db_connection()) as conn:
         conn.execute("DELETE FROM gemini_request_log WHERE ts < ?", (day_start,))
         minute_requests = conn.execute(
-            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ?",
-            (now - 60,),
+            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ? AND model = ?",
+            (now - 60, model_name),
         ).fetchone()[0]
         minute_input_tokens = conn.execute(
-            "SELECT COALESCE(SUM(input_tokens), 0) FROM gemini_request_log WHERE ts >= ?",
-            (now - 60,),
+            "SELECT COALESCE(SUM(input_tokens), 0) FROM gemini_request_log WHERE ts >= ? AND model = ?",
+            (now - 60, model_name),
         ).fetchone()[0]
         day_requests = conn.execute(
-            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ? AND ts < ?",
-            (day_start, day_end),
+            "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ? AND ts < ? AND model = ?",
+            (day_start, day_end, model_name),
+        ).fetchone()[0]
+        day_input_tokens = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) FROM gemini_request_log WHERE ts >= ? AND ts < ? AND model = ?",
+            (day_start, day_end, model_name),
         ).fetchone()[0]
 
-        if minute_requests + 1 > GEMINI_MAX_REQUESTS_PER_MINUTE:
-            return "Gemini 사용량 제한: 분당 요청 수가 14회를 초과하지 않도록 이번 호출을 중단했습니다."
+        if minute_requests + 1 > model_rpm:
+            return f"{model_name} ?? ??: ?? ?? ?? ???? ??? ?? ??? ?????."
 
-        if minute_input_tokens + input_tokens > GEMINI_MAX_INPUT_TOKENS_PER_MINUTE:
-            return "Gemini 사용량 제한: 분당 입력 토큰이 240k를 초과하지 않도록 이번 호출을 중단했습니다."
+        if minute_input_tokens + input_tokens > model_tpm:
+            return f"{model_name} ?? ??: ?? ?? ?? ?? ???? ??? ?? ??? ?????."
 
-        if day_requests + 1 > GEMINI_MAX_REQUESTS_PER_DAY:
-            return "Gemini 사용량 제한: KST 일일 요청 수가 499회를 초과하지 않도록 이번 호출을 중단했습니다."
+        if day_requests + 1 > model_rpd:
+            return f"{model_name} ?? ??: KST ?? ?? ?? ???? ??? ?? ??? ?????."
+
+        if model_tpd and day_input_tokens + input_tokens > int(model_tpd):
+            return f"{model_name} ?? ??: KST ?? ?? ?? ?? ???? ??? ?? ??? ?????."
 
         conn.execute(
             """
             INSERT INTO gemini_request_log (ts, input_tokens, model, refresh_slot)
             VALUES (?, ?, ?, ?)
             """,
-            (now, input_tokens, GEMINI_MODEL_NAME, refresh_slot),
+            (now, input_tokens, model_name, refresh_slot),
         )
 
     return None
@@ -652,21 +706,61 @@ def extract_gemini_text(response):
     return "\n".join(parts).strip()
 
 
+def call_gemini_model(api_key, model_name, prompt):
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name,
+        generation_config={
+            "temperature": 0.25,
+            "top_p": 0.8,
+            "max_output_tokens": 12000,
+            "response_mime_type": "application/json",
+        },
+    )
+    response = model.generate_content(prompt)
+    return extract_gemini_text(response)
+
+
+def call_groq_model(api_key, model_name, prompt):
+    import requests
+
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.25,
+        },
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"{response.status_code} {response.text}")
+    payload = response.json()
+    return (((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+
+
+def call_model(model_config, api_key, prompt):
+    if model_config["provider"] == "gemini":
+        return call_gemini_model(api_key, model_config["model"], prompt)
+    if model_config["provider"] == "groq":
+        return call_groq_model(api_key, model_config["model"], prompt)
+    raise RuntimeError(f"Unsupported provider: {model_config['provider']}")
+
+
 def is_daily_quota_exceeded_error(exc):
     message = str(exc).lower()
-    return (
-        "quota exceeded" in message
-        or "generate_content_free_tier_requests" in message
-        or ("429" in message and "quota" in message)
-    )
+    return "quota exceeded" in message or ("429" in message and "quota" in message)
 
 
-def build_daily_quota_block_reason(exc):
+def build_daily_quota_block_reason(model_name, exc):
     first_line = str(exc).splitlines()[0].strip()
-    return (
-        f"Gemini 일일 쿼터가 이미 초과되어 KST {get_kst_day_key()} 남은 슬롯은 건너뜁니다. "
-        f"원인: {first_line}"
-    )
+    return f"{model_name} ?? ??? ?? ???? KST {get_kst_day_key()} ?? ??? ?????. ??: {first_line}"
 
 
 def is_service_unavailable_error(exc):
@@ -674,62 +768,36 @@ def is_service_unavailable_error(exc):
     return "503" in message or "service unavailable" in message
 
 
-def record_service_unavailable_and_maybe_cooldown(exc):
-    current_count_raw = get_scheduler_state("service_unavailable_count")
+def record_service_unavailable_and_maybe_cooldown(model_name, exc):
+    count_key = model_state_key(model_name, "service_unavailable_count")
+    until_key = model_state_key(model_name, "service_unavailable_until_ts")
+    reason_key = model_state_key(model_name, "service_unavailable_reason")
+    current_count_raw = get_scheduler_state(count_key)
     try:
         current_count = int(current_count_raw or "0")
     except Exception:
         current_count = 0
-
     new_count = current_count + 1
-    set_scheduler_state("service_unavailable_count", str(new_count))
-
+    set_scheduler_state(count_key, str(new_count))
     first_line = str(exc).splitlines()[0].strip()
     if new_count < SERVICE_UNAVAILABLE_THRESHOLD:
-        return (
-            f"Gemini 503 장애 감지: 연속 {new_count}회 발생. "
-            f"원인: {first_line}"
-        )
-
+        return f"{model_name} 503 ?? ??: ?? {new_count}? ??. ??: {first_line}"
     until_ts = time.time() + SERVICE_UNAVAILABLE_COOLDOWN_SECONDS
-    until_text = datetime.fromtimestamp(
-        until_ts, ZoneInfo("Asia/Seoul")
-    ).strftime("%Y-%m-%d %H:%M:%S")
-    reason = (
-        f"Gemini 503 장애가 연속 {new_count}회 발생해 "
-        f"{until_text} KST까지 추가 호출을 건너뜁니다. 원인: {first_line}"
-    )
-    set_scheduler_state("service_unavailable_until_ts", str(until_ts))
-    set_scheduler_state("service_unavailable_reason", reason)
+    until_text = datetime.fromtimestamp(until_ts, ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+    reason = f"{model_name} 503 ??? ?? {new_count}? ??? {until_text} KST?? ?? ??? ?????. ??: {first_line}"
+    set_scheduler_state(until_key, str(until_ts))
+    set_scheduler_state(reason_key, reason)
     return reason
 
 
-def clear_service_unavailable_state():
-    clear_scheduler_state("service_unavailable_count")
-    clear_scheduler_state("service_unavailable_until_ts")
-    clear_scheduler_state("service_unavailable_reason")
-
+def clear_service_unavailable_state(model_name):
+    clear_scheduler_state(model_state_key(model_name, "service_unavailable_count"))
+    clear_scheduler_state(model_state_key(model_name, "service_unavailable_until_ts"))
+    clear_scheduler_state(model_state_key(model_name, "service_unavailable_reason"))
 
 def refresh_ai_for_current_slot():
     cleanup_expired_store()
     refresh_slot = get_current_refresh_slot()
-    api_key = get_gemini_api_key()
-
-    if not api_key:
-        print("GEMINI_API_KEY is not configured.")
-        return 1
-
-    daily_quota_block_reason = get_daily_quota_block_reason()
-    if daily_quota_block_reason:
-        record_slot_attempt(refresh_slot, "skipped", daily_quota_block_reason)
-        print(daily_quota_block_reason)
-        return 0
-
-    service_unavailable_cooldown_reason = get_service_unavailable_cooldown_reason()
-    if service_unavailable_cooldown_reason:
-        record_slot_attempt(refresh_slot, "skipped", service_unavailable_cooldown_reason)
-        print(service_unavailable_cooldown_reason)
-        return 0
 
     if should_skip_slot(refresh_slot):
         print(f"Slot already completed or currently running: {refresh_slot}")
@@ -744,7 +812,6 @@ def refresh_ai_for_current_slot():
         if (
             isinstance(cached_result, dict)
             and cached_result.get("cache_version") == AI_CACHE_VERSION
-            and cached_result.get("model") == GEMINI_MODEL_NAME
             and cached_result.get("data")
             and is_fresh_ai_cache(cached_result, refresh_slot)
         ):
@@ -752,59 +819,62 @@ def refresh_ai_for_current_slot():
             print(f"Cache already fresh for slot: {refresh_slot}")
             return 0
 
-        import google.generativeai as genai
-
         news_data = collect_news()
         prompt = build_ai_persona_prompt(news_data)
         record_slot_attempt(refresh_slot, "running")
+        attempt_errors = []
 
-        limit_error = reserve_gemini_capacity(prompt, refresh_slot)
-        if limit_error:
-            record_slot_attempt(refresh_slot, "skipped", limit_error)
-            print(limit_error)
-            return 0
+        for model_config in MODEL_CHAIN:
+            model_name = model_config["model"]
+            api_key = get_api_key_for_model(model_config)
+            if not api_key:
+                attempt_errors.append(f"{model_name}: API key is not configured")
+                continue
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            GEMINI_MODEL_NAME,
-            generation_config={
-                "temperature": 0.25,
-                "top_p": 0.8,
-                "max_output_tokens": 12000,
-                "response_mime_type": "application/json",
-            },
-        )
+            daily_quota_block_reason = get_daily_quota_block_reason(model_name)
+            if daily_quota_block_reason:
+                attempt_errors.append(daily_quota_block_reason)
+                continue
 
-        response = model.generate_content(prompt)
-        response_text = extract_gemini_text(response)
-        parsed = parse_gemini_json(response_text)
+            service_unavailable_cooldown_reason = get_service_unavailable_cooldown_reason(model_name)
+            if service_unavailable_cooldown_reason:
+                attempt_errors.append(service_unavailable_cooldown_reason)
+                continue
 
-        if parsed is None:
-            record_slot_attempt(refresh_slot, "failed", "AI 응답을 JSON으로 파싱하지 못했습니다.")
-            print("Failed to parse Gemini JSON response.")
-            return 1
+            limit_error = reserve_model_capacity(prompt, refresh_slot, model_config)
+            if limit_error:
+                attempt_errors.append(limit_error)
+                continue
 
-        save_ai_result(refresh_slot, sanitize_ai_payload(parsed))
-        clear_service_unavailable_state()
-        record_slot_attempt(refresh_slot, "success")
-        print(f"AI cache refreshed for slot: {refresh_slot}")
+            try:
+                response_text = call_model(model_config, api_key, prompt)
+                parsed = parse_gemini_json(response_text)
+                if parsed is None:
+                    attempt_errors.append(f"{model_name}: failed to parse JSON response")
+                    continue
+
+                save_ai_result(refresh_slot, sanitize_ai_payload(parsed), model_name)
+                clear_service_unavailable_state(model_name)
+                record_slot_attempt(refresh_slot, "success", model_name)
+                print(f"AI cache refreshed for slot: {refresh_slot} via {model_name}")
+                return 0
+            except Exception as exc:
+                if is_daily_quota_exceeded_error(exc):
+                    quota_reason = build_daily_quota_block_reason(model_name, exc)
+                    set_scheduler_state(model_state_key(model_name, "quota_blocked_day"), get_kst_day_key())
+                    set_scheduler_state(model_state_key(model_name, "quota_block_reason"), quota_reason)
+                    attempt_errors.append(quota_reason)
+                    continue
+                if is_service_unavailable_error(exc):
+                    cooldown_reason = record_service_unavailable_and_maybe_cooldown(model_name, exc)
+                    attempt_errors.append(cooldown_reason)
+                    continue
+                attempt_errors.append(f"{model_name}: {str(exc).splitlines()[0].strip()}")
+
+        final_error = " | ".join(attempt_errors) if attempt_errors else "No available model succeeded."
+        record_slot_attempt(refresh_slot, "skipped", final_error)
+        print(final_error)
         return 0
-    except Exception as exc:
-        if is_daily_quota_exceeded_error(exc):
-            quota_reason = build_daily_quota_block_reason(exc)
-            set_scheduler_state("quota_blocked_day", get_kst_day_key())
-            set_scheduler_state("quota_block_reason", quota_reason)
-            record_slot_attempt(refresh_slot, "skipped", quota_reason)
-            print(quota_reason)
-            return 0
-        if is_service_unavailable_error(exc):
-            cooldown_reason = record_service_unavailable_and_maybe_cooldown(exc)
-            record_slot_attempt(refresh_slot, "skipped", cooldown_reason)
-            print(cooldown_reason)
-            return 0
-        record_slot_attempt(refresh_slot, "failed", str(exc))
-        print(f"AI cache refresh failed: {exc}")
-        return 1
     finally:
         release_refresh_lock()
 

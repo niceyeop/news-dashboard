@@ -1,0 +1,39 @@
+name: Deploy to Oracle Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start ssh-agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+
+      - name: Add known host
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$ORACLE_HOST" >> ~/.ssh/known_hosts
+
+      - name: Run deploy script on Oracle server
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          APP_DIR: ${{ secrets.APP_DIR }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          ssh -p "${ORACLE_PORT:-22}" "${ORACLE_USER}@${ORACLE_HOST}" \
+            "APP_DIR='${APP_DIR}' REPO_URL='https://github.com/${GITHUB_REPOSITORY}.git' bash -s" \
+            < scripts/deploy.sh

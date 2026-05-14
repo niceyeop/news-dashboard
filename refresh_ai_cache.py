@@ -147,6 +147,18 @@ def init_ai_store():
                 updated_at REAL NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_attempt_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                refresh_slot TEXT NOT NULL,
+                model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT
+            )
+        """)
 
 
 def get_kst_now():
@@ -258,6 +270,7 @@ def cleanup_expired_store():
         conn.execute("DELETE FROM scheduler_state WHERE updated_at < ?", (cutoff,))
         conn.execute("DELETE FROM refresh_locks WHERE acquired_at < ?", (cutoff,))
         conn.execute("DELETE FROM ai_cache WHERE generated_at < ?", (cutoff,))
+        conn.execute("DELETE FROM model_attempt_log WHERE ts < ?", (cutoff,))
 
 
 def acquire_refresh_lock():
@@ -322,6 +335,28 @@ def record_slot_attempt(refresh_slot, status, error=None):
                 error = excluded.error
             """,
             (refresh_slot, time.time(), status, error),
+        )
+
+
+def record_model_attempt(refresh_slot, model_config, attempt_number, status, error=None):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        conn.execute(
+            """
+            INSERT INTO model_attempt_log (
+                ts, refresh_slot, model, provider, attempt_number, status, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time(),
+                refresh_slot,
+                model_config["model"],
+                model_config["provider"],
+                attempt_number,
+                status,
+                error,
+            ),
         )
 
 
@@ -413,16 +448,16 @@ def reserve_model_capacity(input_text, refresh_slot, model_config):
         ).fetchone()[0]
 
         if minute_requests + 1 > model_rpm:
-            return f"{model_name} ?? ??: ?? ?? ?? ???? ??? ?? ??? ?????."
+            return f"{model_name} rate limit: RPM would be exceeded; skipping this slot."
 
         if minute_input_tokens + input_tokens > model_tpm:
-            return f"{model_name} ?? ??: ?? ?? ?? ?? ???? ??? ?? ??? ?????."
+            return f"{model_name} rate limit: TPM would be exceeded; skipping this slot."
 
         if day_requests + 1 > model_rpd:
-            return f"{model_name} ?? ??: KST ?? ?? ?? ???? ??? ?? ??? ?????."
+            return f"{model_name} rate limit: KST daily requests would be exceeded; skipping this slot."
 
         if model_tpd and day_input_tokens + input_tokens > int(model_tpd):
-            return f"{model_name} ?? ??: KST ?? ?? ?? ?? ???? ??? ?? ??? ?????."
+            return f"{model_name} rate limit: KST daily input tokens would be exceeded; skipping this slot."
 
         conn.execute(
             """
@@ -583,7 +618,7 @@ def sanitize_ai_payload(ai_data):
     return ai_data
 
 
-def build_ai_persona_prompt(news_data):
+def build_ai_persona_prompt_legacy(news_data):
     input_articles = []
 
     for press, articles in news_data.items():
@@ -687,6 +722,103 @@ def build_ai_persona_prompt(news_data):
 """
 
 
+def build_ai_persona_prompt(news_data):
+    input_articles = []
+
+    for press, articles in news_data.items():
+        for article in articles:
+            title = article.get("title", "")
+            url = article.get("url")
+            if title and "데이터를 불러오지 못했습니다" not in title:
+                input_articles.append({
+                    "media": press,
+                    "title": title,
+                    "url": url,
+                })
+
+    articles_json = json.dumps(input_articles, ensure_ascii=False, separators=(",", ":"))
+
+    return f"""
+당신은 한국 뉴스 편집 데스크를 보조하는 AI 에디터입니다.
+
+아래에는 네이버 언론사별 주요 뉴스 제목만 제공됩니다. 기사 본문은 제공되지 않습니다.
+제목에 없는 사실을 추정하거나 단정하지 말고, 제목 목록에서 반복적으로 드러나는 흐름만 분석하세요.
+
+목표:
+- 현재 뉴스 트렌드를 2~3문장으로 요약합니다.
+- 핵심 키워드 5개를 고릅니다.
+- 편집 방향 제안 1개를 작성합니다.
+- 현재 핫이슈 6개를 선정합니다.
+- 기준 매체인 {TARGET_PRESS} 주요 뉴스 목록에는 없지만, 다른 언론에서 반복적으로 다루는 이슈를 최대 5개 제안합니다.
+
+출력 규칙:
+- 반드시 JSON 객체 하나만 출력하세요.
+- Markdown, HTML, 코드블록, 설명 문장을 출력하지 마세요.
+- 모든 문자열 값에는 HTML 태그나 class 속성을 넣지 마세요.
+- 점수는 1~5 사이 정수만 사용하세요.
+- URL이 없으면 null을 사용하세요.
+- related_articles와 reference_articles에는 입력 기사 목록에 실제 존재하는 기사만 넣으세요.
+
+JSON 스키마:
+{{
+  "dashboard_summary": {{
+    "overall_trend": "현재 뉴스 흐름 요약",
+    "top_keywords": ["키워드1", "키워드2", "키워드3", "키워드4", "키워드5"],
+    "editorial_note": "편집 방향 제안"
+  }},
+  "issues": [
+    {{
+      "rank": 1,
+      "issue_title": "이슈명",
+      "category": "정치",
+      "one_line_summary": "이슈 한 줄 요약",
+      "why_it_matters": "중요한 이유",
+      "related_articles": [
+        {{"media": "언론사명", "title": "기사 제목", "url": null}}
+      ],
+      "recommended_article": {{
+        "media": "언론사명",
+        "title": "인용 추천 기사 제목",
+        "url": null,
+        "reason": "추천 이유"
+      }},
+      "scores": {{
+        "importance": 1,
+        "virality": 1,
+        "reader_interest": 1,
+        "freshness": 1
+      }},
+      "editor_comment": "편집 관점 코멘트"
+    }}
+  ],
+  "missed_articles": [
+    {{
+      "rank": 1,
+      "issue_title": "{TARGET_PRESS}가 놓친 것으로 보이는 이슈명",
+      "category": "사회",
+      "why_missed": "놓친 기사로 판단한 이유",
+      "coverage_signal": "다른 언론 보도 신호",
+      "suggested_angle": "{TARGET_PRESS}가 다룰 수 있는 관점",
+      "urgency_score": 1,
+      "reference_articles": [
+        {{"media": "타 언론사명", "title": "참고 기사 제목", "url": null}}
+      ]
+    }}
+  ]
+}}
+
+카테고리는 다음 중 하나만 사용하세요:
+정치, 경제, 사회, 국제, 생활, IT·과학, 문화, 스포츠·연예, 오피니언, 기타
+
+배열 개수:
+- issues는 반드시 6개입니다.
+- missed_articles는 0~5개입니다.
+
+기사 목록:
+{articles_json}
+"""
+
+
 def extract_gemini_text(response):
     text = getattr(response, "text", "")
     if text:
@@ -715,7 +847,7 @@ def call_gemini_model(api_key, model_name, prompt):
         generation_config={
             "temperature": 0.25,
             "top_p": 0.8,
-            "max_output_tokens": 12000,
+            "max_output_tokens": 6000,
             "response_mime_type": "application/json",
         },
     )
@@ -760,12 +892,26 @@ def is_daily_quota_exceeded_error(exc):
 
 def build_daily_quota_block_reason(model_name, exc):
     first_line = str(exc).splitlines()[0].strip()
-    return f"{model_name} ?? ??? ?? ???? KST {get_kst_day_key()} ?? ??? ?????. ??: {first_line}"
+    return (
+        f"{model_name} daily quota is blocked for KST {get_kst_day_key()}. "
+        f"Remaining slots will be skipped. Reason: {first_line}"
+    )
 
 
 def is_service_unavailable_error(exc):
     message = str(exc).lower()
     return "503" in message or "service unavailable" in message
+
+
+def is_transient_retryable_error(exc):
+    message = str(exc).lower()
+    return (
+        is_service_unavailable_error(exc)
+        or "timeout" in message
+        or "timed out" in message
+        or "deadline" in message
+        or "temporarily unavailable" in message
+    )
 
 
 def record_service_unavailable_and_maybe_cooldown(model_name, exc):
@@ -781,10 +927,13 @@ def record_service_unavailable_and_maybe_cooldown(model_name, exc):
     set_scheduler_state(count_key, str(new_count))
     first_line = str(exc).splitlines()[0].strip()
     if new_count < SERVICE_UNAVAILABLE_THRESHOLD:
-        return f"{model_name} 503 ?? ??: ?? {new_count}? ??. ??: {first_line}"
+        return f"{model_name} transient 503 detected: consecutive={new_count}. Reason: {first_line}"
     until_ts = time.time() + SERVICE_UNAVAILABLE_COOLDOWN_SECONDS
     until_text = datetime.fromtimestamp(until_ts, ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
-    reason = f"{model_name} 503 ??? ?? {new_count}? ??? {until_text} KST?? ?? ??? ?????. ??: {first_line}"
+    reason = (
+        f"{model_name} 503 cooldown active after {new_count} consecutive failures. "
+        f"Skipping calls until {until_text} KST. Reason: {first_line}"
+    )
     set_scheduler_state(until_key, str(until_ts))
     set_scheduler_state(reason_key, reason)
     return reason
@@ -828,48 +977,76 @@ def refresh_ai_for_current_slot():
             model_name = model_config["model"]
             api_key = get_api_key_for_model(model_config)
             if not api_key:
-                attempt_errors.append(f"{model_name}: API key is not configured")
+                error = f"{model_name}: API key is not configured"
+                record_model_attempt(refresh_slot, model_config, 0, "skipped", error)
+                attempt_errors.append(error)
                 continue
 
             daily_quota_block_reason = get_daily_quota_block_reason(model_name)
             if daily_quota_block_reason:
+                record_model_attempt(refresh_slot, model_config, 0, "skipped", daily_quota_block_reason)
                 attempt_errors.append(daily_quota_block_reason)
                 continue
 
             service_unavailable_cooldown_reason = get_service_unavailable_cooldown_reason(model_name)
             if service_unavailable_cooldown_reason:
+                record_model_attempt(refresh_slot, model_config, 0, "skipped", service_unavailable_cooldown_reason)
                 attempt_errors.append(service_unavailable_cooldown_reason)
                 continue
 
-            limit_error = reserve_model_capacity(prompt, refresh_slot, model_config)
-            if limit_error:
-                attempt_errors.append(limit_error)
-                continue
+            max_attempts = 2 if model_config["provider"] == "gemini" else 1
 
-            try:
-                response_text = call_model(model_config, api_key, prompt)
-                parsed = parse_gemini_json(response_text)
-                if parsed is None:
-                    attempt_errors.append(f"{model_name}: failed to parse JSON response")
-                    continue
+            for attempt_number in range(1, max_attempts + 1):
+                limit_error = reserve_model_capacity(prompt, refresh_slot, model_config)
+                if limit_error:
+                    record_model_attempt(refresh_slot, model_config, attempt_number, "skipped", limit_error)
+                    attempt_errors.append(limit_error)
+                    break
 
-                save_ai_result(refresh_slot, sanitize_ai_payload(parsed), model_name)
-                clear_service_unavailable_state(model_name)
-                record_slot_attempt(refresh_slot, "success", model_name)
-                print(f"AI cache refreshed for slot: {refresh_slot} via {model_name}")
-                return 0
-            except Exception as exc:
-                if is_daily_quota_exceeded_error(exc):
-                    quota_reason = build_daily_quota_block_reason(model_name, exc)
-                    set_scheduler_state(model_state_key(model_name, "quota_blocked_day"), get_kst_day_key())
-                    set_scheduler_state(model_state_key(model_name, "quota_block_reason"), quota_reason)
-                    attempt_errors.append(quota_reason)
-                    continue
-                if is_service_unavailable_error(exc):
-                    cooldown_reason = record_service_unavailable_and_maybe_cooldown(model_name, exc)
-                    attempt_errors.append(cooldown_reason)
-                    continue
-                attempt_errors.append(f"{model_name}: {str(exc).splitlines()[0].strip()}")
+                try:
+                    response_text = call_model(model_config, api_key, prompt)
+                    parsed = parse_gemini_json(response_text)
+                    if parsed is None:
+                        error = f"{model_name}: failed to parse JSON response"
+                        record_model_attempt(refresh_slot, model_config, attempt_number, "failed", error)
+                        attempt_errors.append(error)
+                        break
+
+                    save_ai_result(refresh_slot, sanitize_ai_payload(parsed), model_name)
+                    clear_service_unavailable_state(model_name)
+                    record_model_attempt(refresh_slot, model_config, attempt_number, "success")
+                    record_slot_attempt(refresh_slot, "success", model_name)
+                    print(f"AI cache refreshed for slot: {refresh_slot} via {model_name}")
+                    return 0
+                except Exception as exc:
+                    error = str(exc).splitlines()[0].strip()
+                    record_model_attempt(refresh_slot, model_config, attempt_number, "failed", error)
+
+                    if is_daily_quota_exceeded_error(exc):
+                        quota_reason = build_daily_quota_block_reason(model_name, exc)
+                        set_scheduler_state(model_state_key(model_name, "quota_blocked_day"), get_kst_day_key())
+                        set_scheduler_state(model_state_key(model_name, "quota_block_reason"), quota_reason)
+                        attempt_errors.append(quota_reason)
+                        break
+
+                    if is_service_unavailable_error(exc):
+                        cooldown_reason = record_service_unavailable_and_maybe_cooldown(model_name, exc)
+                        attempt_errors.append(cooldown_reason)
+                        if attempt_number < max_attempts:
+                            time.sleep(5)
+                            continue
+                        break
+
+                    if (
+                        model_config["provider"] == "gemini"
+                        and is_transient_retryable_error(exc)
+                        and attempt_number < max_attempts
+                    ):
+                        time.sleep(5)
+                        continue
+
+                    attempt_errors.append(f"{model_name}: {error}")
+                    break
 
         final_error = " | ".join(attempt_errors) if attempt_errors else "No available model succeeded."
         record_slot_attempt(refresh_slot, "skipped", final_error)

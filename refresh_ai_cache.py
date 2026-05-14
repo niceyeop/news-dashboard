@@ -27,7 +27,7 @@ MODEL_CHAIN = [
         "model": "gemini-3.1-flash-lite",
         "api_keys": ["GEMINI_API_KEY"],
         "rpm": 14,
-        "rpd": 144,
+        "rpd": 400,
         "tpm": 240_000,
         "tpd": None,
     },

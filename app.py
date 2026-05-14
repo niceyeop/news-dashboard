@@ -262,16 +262,18 @@ def get_dashboard_stats():
     stats = {
         "last_refresh_slot": "",
         "last_generated_at": None,
+        "last_model": "",
         "today_ai_calls": 0,
     }
 
     with closing(get_db_connection()) as conn:
         cached_row = conn.execute(
-            "SELECT refresh_slot, generated_at FROM ai_cache WHERE cache_key = 'latest'"
+            "SELECT refresh_slot, generated_at, model FROM ai_cache WHERE cache_key = 'latest'"
         ).fetchone()
         if cached_row:
             stats["last_refresh_slot"] = str(cached_row["refresh_slot"] or "")
             stats["last_generated_at"] = float(cached_row["generated_at"])
+            stats["last_model"] = str(cached_row["model"] or "")
 
         table_exists = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gemini_request_log'"
@@ -294,7 +296,13 @@ def format_timestamp(ts):
     if not ts:
         return "-"
     dt = datetime.fromtimestamp(float(ts), ZoneInfo("Asia/Seoul"))
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%m-%d %H:%M:%S")
+
+
+def format_refresh_slot(slot_text):
+    if not slot_text:
+        return "-"
+    return str(slot_text)[5:]
 
 
 def get_kst_now():
@@ -1060,10 +1068,11 @@ st.markdown(
 )
 
 dashboard_stats = get_dashboard_stats()
-metric_cols = st.columns(3)
+metric_cols = st.columns(4)
 metric_cols[0].metric("마지막 분석 시간", format_timestamp(dashboard_stats["last_generated_at"]))
-metric_cols[1].metric("오늘 AI 호출 횟수", f"{dashboard_stats['today_ai_calls']} / 144")
-metric_cols[2].metric("마지막 분석 슬롯", dashboard_stats["last_refresh_slot"] or "-")
+metric_cols[1].metric("마지막 사용 AI", dashboard_stats["last_model"] or "-")
+metric_cols[2].metric("오늘 AI 호출 횟수", f"{dashboard_stats['today_ai_calls']} / 400")
+metric_cols[3].metric("마지막 분석 슬롯", format_refresh_slot(dashboard_stats["last_refresh_slot"]))
 
 with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
     news_data = fetch_news(refresh_slot)

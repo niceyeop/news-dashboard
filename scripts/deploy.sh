@@ -6,11 +6,16 @@ set -euo pipefail
 BRANCH="${BRANCH:-main}"
 
 if [ ! -d "$APP_DIR/.git" ]; then
+  BACKUP_DIR=""
   if [ -d "$APP_DIR" ] && [ "$(ls -A "$APP_DIR" 2>/dev/null)" ]; then
-    mv "$APP_DIR" "${APP_DIR}_backup_$(date +%Y%m%d%H%M%S)"
+    BACKUP_DIR="${APP_DIR}_backup_$(date +%Y%m%d%H%M%S)"
+    mv "$APP_DIR" "$BACKUP_DIR"
   fi
   mkdir -p "$APP_DIR"
   git clone "$REPO_URL" "$APP_DIR"
+  if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/.env" ] && [ ! -f "$APP_DIR/.env" ]; then
+    cp "$BACKUP_DIR/.env" "$APP_DIR/.env"
+  fi
 fi
 
 cd "$APP_DIR"
@@ -34,4 +39,7 @@ fi
 
 sudo systemctl daemon-reload
 sudo systemctl restart news-dashboard.service
-sudo systemctl --no-pager --full status news-dashboard.service
+if ! sudo systemctl --no-pager --full status news-dashboard.service; then
+  sudo journalctl -u news-dashboard.service -n 120 --no-pager || true
+  exit 1
+fi

@@ -17,7 +17,7 @@ GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
 GEMINI_MAX_REQUESTS_PER_MINUTE = 14
 GEMINI_MAX_INPUT_TOKENS_PER_MINUTE = 240_000
-GEMINI_MAX_REQUESTS_PER_DAY = 499
+GEMINI_MAX_REQUESTS_PER_DAY = 144
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
 AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
 AI_REFRESH_LOCK_TTL_SECONDS = 120
@@ -103,6 +103,13 @@ def init_ai_store():
                 acquired_at REAL NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheduler_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
 
 
 def get_kst_now():
@@ -133,6 +140,54 @@ def kst_day_bounds():
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return start.timestamp(), end.timestamp()
+
+
+def get_kst_day_key():
+    return get_kst_now().strftime("%Y-%m-%d")
+
+
+def get_scheduler_state(state_key):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        row = conn.execute(
+            "SELECT state_value FROM scheduler_state WHERE state_key = ?",
+            (state_key,),
+        ).fetchone()
+    return row["state_value"] if row else ""
+
+
+def set_scheduler_state(state_key, state_value):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        conn.execute(
+            """
+            INSERT INTO scheduler_state (state_key, state_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value = excluded.state_value,
+                updated_at = excluded.updated_at
+            """,
+            (state_key, state_value, time.time()),
+        )
+
+
+def get_daily_quota_block_reason():
+    blocked_day = get_scheduler_state("quota_blocked_day")
+    if blocked_day != get_kst_day_key():
+        return ""
+    return get_scheduler_state("quota_block_reason")
+
+
+def cleanup_expired_store():
+    init_ai_store()
+    cutoff = time.time() - 24 * 60 * 60
+
+    with closing(get_db_connection()) as conn:
+        conn.execute("DELETE FROM gemini_request_log WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM slot_attempts WHERE attempted_at < ?", (cutoff,))
+        conn.execute("DELETE FROM scheduler_state WHERE updated_at < ?", (cutoff,))
+        conn.execute("DELETE FROM refresh_locks WHERE acquired_at < ?", (cutoff,))
+        conn.execute("DELETE FROM ai_cache WHERE generated_at < ?", (cutoff,))
 
 
 def acquire_refresh_lock():
@@ -569,13 +624,37 @@ def extract_gemini_text(response):
     return "\n".join(parts).strip()
 
 
+def is_daily_quota_exceeded_error(exc):
+    message = str(exc).lower()
+    return (
+        "quota exceeded" in message
+        or "generate_content_free_tier_requests" in message
+        or ("429" in message and "quota" in message)
+    )
+
+
+def build_daily_quota_block_reason(exc):
+    first_line = str(exc).splitlines()[0].strip()
+    return (
+        f"Gemini 일일 쿼터가 이미 초과되어 KST {get_kst_day_key()} 남은 슬롯은 건너뜁니다. "
+        f"원인: {first_line}"
+    )
+
+
 def refresh_ai_for_current_slot():
+    cleanup_expired_store()
     refresh_slot = get_current_refresh_slot()
     api_key = get_gemini_api_key()
 
     if not api_key:
         print("GEMINI_API_KEY is not configured.")
         return 1
+
+    daily_quota_block_reason = get_daily_quota_block_reason()
+    if daily_quota_block_reason:
+        record_slot_attempt(refresh_slot, "skipped", daily_quota_block_reason)
+        print(daily_quota_block_reason)
+        return 0
 
     if should_skip_slot(refresh_slot):
         print(f"Slot already completed or currently running: {refresh_slot}")
@@ -635,6 +714,13 @@ def refresh_ai_for_current_slot():
         print(f"AI cache refreshed for slot: {refresh_slot}")
         return 0
     except Exception as exc:
+        if is_daily_quota_exceeded_error(exc):
+            quota_reason = build_daily_quota_block_reason(exc)
+            set_scheduler_state("quota_blocked_day", get_kst_day_key())
+            set_scheduler_state("quota_block_reason", quota_reason)
+            record_slot_attempt(refresh_slot, "skipped", quota_reason)
+            print(quota_reason)
+            return 0
         record_slot_attempt(refresh_slot, "failed", str(exc))
         print(f"AI cache refresh failed: {exc}")
         return 1

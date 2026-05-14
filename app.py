@@ -20,6 +20,7 @@ TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
+UI_POLL_INTERVAL_MS = 15 * 1000
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
 AI_DB_PATH = AI_CACHE_DIR / "news_dashboard_cache.sqlite3"
 
@@ -89,15 +90,16 @@ def to_plain_display_text(value, prefer_after_label=None):
 
 def strip_embedded_card_text(value, fallback=""):
     """
-    AI가 텍스트 필드에 대시보드 HTML 카드 전체를 넣은 경우 본문에 노출하지 않습니다.
+    Remove dashboard card markup or boilerplate text accidentally embedded in
+    AI text fields and fall back to plain text when needed.
     """
     text = to_plain_display_text(value)
     card_markers = [
-        "중요도",
-        "확산성",
-        "관심도",
-        "신선도",
-        "추천 노출 기사",
+        "summary",
+        "importance",
+        "???",
+        "priority",
+        "?? ?? ??",
         "score-badge",
         "recommended-box",
     ]
@@ -105,8 +107,8 @@ def strip_embedded_card_text(value, fallback=""):
     original = html.unescape(str(value or ""))
 
     if is_probably_html(original) or any(marker in text for marker in card_markers):
-        if "편집 코멘트:" in text:
-            return text.split("편집 코멘트:", 1)[1].strip()
+        if "?? ???" in text:
+            return text.split("?? ???", 1)[1].strip()
         if any(marker in text for marker in card_markers):
             return fallback
 
@@ -255,6 +257,46 @@ def get_cached_ai_result():
     }
 
 
+def get_dashboard_stats():
+    init_ai_store()
+    stats = {
+        "last_refresh_slot": "",
+        "last_generated_at": None,
+        "today_ai_calls": 0,
+    }
+
+    with closing(get_db_connection()) as conn:
+        cached_row = conn.execute(
+            "SELECT refresh_slot, generated_at FROM ai_cache WHERE cache_key = 'latest'"
+        ).fetchone()
+        if cached_row:
+            stats["last_refresh_slot"] = str(cached_row["refresh_slot"] or "")
+            stats["last_generated_at"] = float(cached_row["generated_at"])
+
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gemini_request_log'"
+        ).fetchone()
+        if table_exists:
+            now = get_kst_now()
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            day_end = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp()
+            stats["today_ai_calls"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM gemini_request_log WHERE ts >= ? AND ts < ?",
+                    (day_start, day_end),
+                ).fetchone()[0]
+            )
+
+    return stats
+
+
+def format_timestamp(ts):
+    if not ts:
+        return "-"
+    dt = datetime.fromtimestamp(float(ts), ZoneInfo("Asia/Seoul"))
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def get_kst_now():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
@@ -277,6 +319,21 @@ def milliseconds_until_next_refresh_slot():
 
     milliseconds = int((next_slot - now).total_seconds() * 1000)
     return max(milliseconds, 1000)
+
+
+def get_autorefresh_interval_ms(current_refresh_slot):
+    cached_result = get_cached_ai_result()
+    cached_slot = ""
+
+    if isinstance(cached_result, dict):
+        cached_slot = str(cached_result.get("refresh_slot", "") or "")
+
+    if cached_slot == current_refresh_slot:
+        return milliseconds_until_next_refresh_slot()
+
+    # The scheduler usually finishes after the slot boundary, so keep polling
+    # briefly until the latest cached result catches up with the current slot.
+    return 15 * 1000
 
 
 # =========================
@@ -990,7 +1047,7 @@ def render_local_missed_articles(news_data):
 
 
 refresh_slot = get_current_refresh_slot()
-st_autorefresh(interval=milliseconds_until_next_refresh_slot(), limit=None, key="news_autorefresh")
+st_autorefresh(interval=UI_POLL_INTERVAL_MS, limit=None, key="news_autorefresh")
 
 
 # =========================
@@ -1001,6 +1058,12 @@ st.markdown(
     f"주요 언론사 네이버 채널의 실시간 주요 뉴스와 핵심 인사이트를 한눈에 파악하세요. "
     f"현재 〈우리가 놓친 기사들〉 기준 언론사는 **{TARGET_PRESS}**입니다."
 )
+
+dashboard_stats = get_dashboard_stats()
+metric_cols = st.columns(3)
+metric_cols[0].metric("??? ?? ??", format_timestamp(dashboard_stats["last_generated_at"]))
+metric_cols[1].metric("?? AI ?? ??", f"{dashboard_stats['today_ai_calls']} / 144")
+metric_cols[2].metric("??? ?? ??", dashboard_stats["last_refresh_slot"] or "-")
 
 with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
     news_data = fetch_news(refresh_slot)

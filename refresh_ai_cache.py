@@ -26,28 +26,19 @@ MODEL_CHAIN = [
         "provider": "gemini",
         "model": "gemini-3.1-flash-lite",
         "api_keys": ["GEMINI_API_KEY"],
-        "rpm": 14,
-        "rpd": 400,
-        "tpm": 240_000,
+        "rpm": 4_000,
+        "rpd": 150_000,
+        "tpm": 4_000_000,
         "tpd": None,
     },
     {
-        "provider": "groq",
-        "model": "llama-3.3-70b-versatile",
-        "api_keys": ["GROQ_API_KEY", "LLAMA_API_KEY"],
-        "rpm": 30,
-        "rpd": 1_000,
-        "tpm": 12_000,
-        "tpd": 100_000,
-    },
-    {
-        "provider": "groq",
-        "model": "openai/gpt-oss-120b",
-        "api_keys": ["GROQ_API_KEY", "GPT_OSS_API_KEY"],
-        "rpm": 30,
-        "rpd": 1_000,
-        "tpm": 8_000,
-        "tpd": 200_000,
+        "provider": "gemini",
+        "model": "gemini-2.5-flash-lite",
+        "api_keys": ["GEMINI_API_KEY"],
+        "rpm": 4_000,
+        "rpd": None,
+        "tpm": 4_000_000,
+        "tpd": None,
     },
 ]
 
@@ -424,7 +415,7 @@ def reserve_model_capacity(input_text, refresh_slot, model_config):
     day_start, day_end = kst_day_bounds()
     model_name = model_config["model"]
     model_rpm = int(model_config["rpm"])
-    model_rpd = int(model_config["rpd"])
+    model_rpd = model_config.get("rpd")
     model_tpm = int(model_config["tpm"])
     model_tpd = model_config.get("tpd")
 
@@ -453,7 +444,7 @@ def reserve_model_capacity(input_text, refresh_slot, model_config):
         if minute_input_tokens + input_tokens > model_tpm:
             return f"{model_name} rate limit: TPM would be exceeded; skipping this slot."
 
-        if day_requests + 1 > model_rpd:
+        if model_rpd is not None and day_requests + 1 > int(model_rpd):
             return f"{model_name} rate limit: KST daily requests would be exceeded; skipping this slot."
 
         if model_tpd and day_input_tokens + input_tokens > int(model_tpd):
@@ -855,33 +846,9 @@ def call_gemini_model(api_key, model_name, prompt):
     return extract_gemini_text(response)
 
 
-def call_groq_model(api_key, model_name, prompt):
-    import requests
-
-    response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.25,
-        },
-        timeout=120,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"{response.status_code} {response.text}")
-    payload = response.json()
-    return (((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
-
-
 def call_model(model_config, api_key, prompt):
     if model_config["provider"] == "gemini":
         return call_gemini_model(api_key, model_config["model"], prompt)
-    if model_config["provider"] == "groq":
-        return call_groq_model(api_key, model_config["model"], prompt)
     raise RuntimeError(f"Unsupported provider: {model_config['provider']}")
 
 

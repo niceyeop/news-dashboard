@@ -43,3 +43,11 @@ if ! sudo systemctl --no-pager --full status news-dashboard.service; then
   sudo journalctl -u news-dashboard.service -n 120 --no-pager || true
   exit 1
 fi
+
+if systemctl list-unit-files news-dashboard-cache.service --no-pager | grep -q '^news-dashboard-cache.service'; then
+  sudo systemctl restart news-dashboard-cache.service
+  if ! sudo systemctl --no-pager --full status news-dashboard-cache.service; then
+    sudo journalctl -u news-dashboard-cache.service -n 120 --no-pager || true
+    exit 1
+  fi
+fi

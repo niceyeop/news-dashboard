@@ -1105,7 +1105,65 @@ def issue_heat(issue):
     return 70
 
 
-def issue_coverage(issue):
+def normalize_match_text(value):
+    text = to_plain_display_text(value).lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def issue_match_terms(issue, max_terms=8):
+    if not isinstance(issue, dict):
+        return []
+
+    source_text = " ".join(
+        [
+            to_plain_display_text(issue.get("issue_title", "")),
+            to_plain_display_text(issue.get("one_line_summary", "")),
+            to_plain_display_text(issue.get("why_it_matters", "")),
+        ]
+    )
+    normalized = normalize_match_text(source_text)
+    if not normalized:
+        return []
+
+    stopwords = {
+        "관련",
+        "논란",
+        "보도",
+        "기사",
+        "이슈",
+        "정부",
+        "대한",
+        "현재",
+        "분석",
+        "핵심",
+    }
+    terms = []
+    for token in normalized.split():
+        if len(token) < 2 or token.isdigit() or token in stopwords:
+            continue
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def issue_coverage(issue, news_data):
+    terms = issue_match_terms(issue)
+    matched_presses = set()
+
+    for press, articles in (news_data or {}).items():
+        for article in articles or []:
+            article_title = normalize_match_text(article.get("title", ""))
+            if article_title and any(term in article_title for term in terms):
+                matched_presses.add(press)
+                break
+
+    if matched_presses:
+        return min(len(matched_presses), len(URLS))
+
     related = issue.get("related_articles", []) if isinstance(issue, dict) else []
     medias = {to_plain_display_text(a.get("media")) for a in related if isinstance(a, dict) and a.get("media")}
     return min(len(medias) or len(related), len(URLS))
@@ -1182,14 +1240,14 @@ def build_heatmap(issues, news_data):
     presses = list((news_data or {}).keys())
     matrix = []
     for issue in issues[:6]:
-        title = to_plain_display_text(issue.get("issue_title", ""))
-        words = [w for w in re.sub(r"[^\w\s]", " ", title).split() if len(w) > 1][:4]
+        terms = issue_match_terms(issue)
         row = []
         for press in presses:
             score = 0
             for article in news_data.get(press, []) or []:
-                article_title = article.get("title", "")
-                score += sum(1 for word in words if word and word in article_title)
+                article_title = normalize_match_text(article.get("title", ""))
+                if article_title and any(term in article_title for term in terms):
+                    score += 1
             row.append(min(score, 3))
         matrix.append(row)
     return presses, matrix
@@ -1324,7 +1382,7 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
         summary_text = safe_html(issue.get("one_line_summary"), "요약 없음")
         why = safe_html(issue.get("why_it_matters"), "중요도 판단 정보 없음")
         heat = issue_heat(issue)
-        coverage = issue_coverage(issue)
+        coverage = issue_coverage(issue, news_data)
         issue_cards.append(
             f'<div class="issue-card"><div class="topic-line {cat_class}"></div>'
             f'<div class="issue-top"><div><div class="rank mono">ISSUE #{html.escape(str(rank)).zfill(2)}</div>'

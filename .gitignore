@@ -9,3 +9,5 @@ ENV/
 env.bak/
 venv.bak/
 .news_dashboard_cache/
+streamlit.out.log
+streamlit.err.log

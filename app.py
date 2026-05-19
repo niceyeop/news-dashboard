@@ -97,18 +97,16 @@ def strip_embedded_card_text(value, fallback=""):
     card_markers = [
         "summary",
         "importance",
-        "요약",
         "priority",
-        "추천 기사",
         "score-badge",
         "recommended-box",
+        "target='_blank'",
+        'target="_blank"',
     ]
 
     original = html.unescape(str(value or ""))
 
     if is_probably_html(original) or any(marker in text for marker in card_markers):
-        if "추천 기사" in text:
-            return text.split("추천 기사", 1)[1].strip()
         if any(marker in text for marker in card_markers):
             return fallback
 
@@ -556,6 +554,29 @@ def normalize_url(url):
     return url
 
 
+def clean_article_title(value):
+    title = to_plain_display_text(value)
+    title = re.sub(r"\s+", " ", title).strip()
+
+    bad_markers = [
+        "<div",
+        "</div",
+        "&lt;div",
+        "NEWSDESK",
+        "DASHBOARD",
+        "핵심 이슈",
+        "언론사별 리드 헤드라인",
+        "AI 에디터",
+        "HEAT × COVERAGE",
+        "DETECTED IN OTHER OUTLETS",
+    ]
+    if any(marker in title for marker in bad_markers):
+        return ""
+    if len(title) > 180:
+        return ""
+    return title
+
+
 def collect_news():
     results = {}
     headers = {
@@ -574,7 +595,7 @@ def collect_news():
             title_nodes = soup.select(".press_news_text")
 
             for node in title_nodes:
-                title = node.get_text(strip=True)
+                title = clean_article_title(node.get_text(" ", strip=True))
                 if not title:
                     continue
 
@@ -591,7 +612,7 @@ def collect_news():
                 title_nodes = soup.select(".cjs_t")
 
                 for node in title_nodes:
-                    title = node.get_text(strip=True)
+                    title = clean_article_title(node.get_text(" ", strip=True))
                     if not title:
                         continue
 
@@ -608,7 +629,7 @@ def collect_news():
                 link_nodes = soup.select("a[href*='/article/']")
 
                 for a_tag in link_nodes:
-                    title = a_tag.get_text(" ", strip=True)
+                    title = clean_article_title(a_tag.get_text(" ", strip=True))
                     article_url = normalize_url(a_tag.get("href"))
 
                     if len(title) >= 8 and title not in [a["title"] for a in articles]:
@@ -1201,38 +1222,38 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     .stApp { background:#f5f3ee; }
     .block-container { max-width:1440px; padding-top:.8rem; padding-bottom:2rem; }
     header[data-testid="stHeader"] { background:transparent; }
-    .nd-v2 { --bg:#f5f3ee; --panel:#fff; --line:#dfdcd1; --line2:#c9c5b8; --ink:#1a1814; --ink2:#5d5749; --ink3:#8d8676; --green:#2f7d5a; --amber:#a06913; --red:#a8493a; --blue:#2c64a0; --violet:#5d4694; font-family:"Pretendard", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); }
+    .nd-v2 { --bg:#f5f3ee; --panel:#fff; --line:#dfdcd1; --line2:#c9c5b8; --ink:#1a1814; --ink2:#5d5749; --ink3:#8d8676; --green:#2f7d5a; --amber:#a06913; --red:#a8493a; --blue:#2c64a0; --violet:#5d4694; font-family:"Pretendard", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); font-size:14px; }
     .nd-v2 * { box-sizing:border-box; }
     .nd-v2 .mono { font-family:"JetBrains Mono", Consolas, monospace; }
     .nd-v2 .topnav { display:flex; justify-content:space-between; align-items:center; padding:10px 16px; border:1px solid var(--line2); background:var(--panel); }
     .nd-v2 .brand { font-size:11px; letter-spacing:.22em; color:var(--green); font-weight:800; }
     .nd-v2 .tabs { display:flex; gap:1px; background:var(--line); padding:1px; margin-left:24px; }
-    .nd-v2 .tab { padding:5px 12px; font-size:10px; letter-spacing:.12em; color:var(--ink2); background:var(--bg); }
+    .nd-v2 .tab { padding:6px 12px; font-size:11px; letter-spacing:.12em; color:var(--ink2); background:var(--bg); }
     .nd-v2 .tab.active { background:var(--green); color:#fff; }
-    .nd-v2 .status { display:flex; gap:16px; font-size:11px; color:var(--ink2); align-items:center; }
+    .nd-v2 .status { display:flex; gap:16px; font-size:12px; color:var(--ink2); align-items:center; }
     .nd-v2 .live { color:var(--green); font-weight:800; }
     .nd-v2 .hero { display:grid; grid-template-columns:1.3fr 1fr; gap:28px; padding:28px 18px 22px; border-left:1px solid var(--line2); border-right:1px solid var(--line2); border-bottom:1px solid var(--line2); background:var(--bg); }
     .nd-v2 .eyebrow { font-size:10px; letter-spacing:.2em; color:var(--ink3); margin-bottom:12px; }
     .nd-v2 h1 { margin:0; font-size:34px; line-height:1.12; letter-spacing:-.03em; }
     .nd-v2 h1 span { color:var(--green); }
-    .nd-v2 .sub { max-width:680px; margin-top:10px; color:var(--ink2); line-height:1.55; font-size:13px; }
+    .nd-v2 .sub { max-width:680px; margin-top:10px; color:var(--ink2); line-height:1.6; font-size:15px; }
     .nd-v2 .metrics { display:grid; grid-template-columns:repeat(4, 1fr); gap:1px; background:var(--line); border:1px solid var(--line2); align-self:start; }
     .nd-v2 .metric { background:var(--panel); padding:14px 12px; min-height:84px; }
     .nd-v2 .metric .lbl { font-size:9px; letter-spacing:.16em; color:var(--ink3); text-transform:uppercase; }
-    .nd-v2 .metric .val { margin-top:6px; font-family:"JetBrains Mono", Consolas, monospace; font-size:18px; font-weight:700; color:var(--ink); word-break:break-word; }
+    .nd-v2 .metric .val { margin-top:6px; font-family:"JetBrains Mono", Consolas, monospace; font-size:20px; font-weight:700; color:var(--ink); word-break:break-word; }
     .nd-v2 .metric .val.green { color:var(--green); } .nd-v2 .metric .val.amber { color:var(--amber); }
     .nd-v2 .metric .subv { margin-top:3px; font-size:10px; color:var(--ink3); }
     .nd-v2 .main-grid { display:grid; grid-template-columns:minmax(0, 1fr) 380px; gap:1px; background:var(--line2); border-left:1px solid var(--line2); border-right:1px solid var(--line2); }
     .nd-v2 .panel { background:var(--bg); padding:18px 20px; }
     .nd-v2 .panel.full { border:1px solid var(--line2); border-top:0; }
     .nd-v2 .panel-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; padding-bottom:10px; border-bottom:1px dashed var(--line2); }
-    .nd-v2 .panel-head h2 { margin:0; font-size:14px; letter-spacing:.02em; font-weight:800; }
-    .nd-v2 .panel-head .meta { font-family:"JetBrains Mono", Consolas, monospace; font-size:10px; color:var(--ink3); letter-spacing:.1em; }
-    .nd-v2 .flow { font-size:15px; line-height:1.7; }
-    .nd-v2 .note { display:flex; gap:14px; margin-top:14px; padding:13px; background:var(--panel); border-left:2px solid var(--amber); color:var(--ink2); font-size:13px; line-height:1.55; }
+    .nd-v2 .panel-head h2 { margin:0; font-size:16px; letter-spacing:.02em; font-weight:800; }
+    .nd-v2 .panel-head .meta { font-family:"JetBrains Mono", Consolas, monospace; font-size:11px; color:var(--ink3); letter-spacing:.1em; }
+    .nd-v2 .flow { font-size:16px; line-height:1.75; }
+    .nd-v2 .note { display:flex; gap:14px; margin-top:14px; padding:14px; background:var(--panel); border-left:2px solid var(--amber); color:var(--ink2); font-size:14px; line-height:1.6; }
     .nd-v2 .note .badge { flex:0 0 auto; font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; color:var(--amber); letter-spacing:.16em; }
     .nd-v2 .kw-list { display:flex; flex-direction:column; gap:7px; }
-    .nd-v2 .kw-row { display:grid; grid-template-columns:72px 1fr 32px; gap:9px; align-items:center; font-family:"JetBrains Mono", Consolas, monospace; font-size:11px; }
+    .nd-v2 .kw-row { display:grid; grid-template-columns:82px 1fr 34px; gap:9px; align-items:center; font-family:"JetBrains Mono", Consolas, monospace; font-size:12px; }
     .nd-v2 .kw-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink); }
     .nd-v2 .bar { height:8px; background:var(--panel); } .nd-v2 .fill { display:block; height:100%; background:var(--green); }
     .nd-v2 .issue-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; }
@@ -1244,9 +1265,9 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     .nd-v2 .topic { display:inline-block; margin-top:8px; padding:3px 8px; border:1px solid currentColor; border-radius:2px; font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.12em; color:var(--green); }
     .nd-v2 .topic.politics,.nd-v2 .topic.global { color:var(--blue); } .nd-v2 .topic.economy { color:var(--amber); } .nd-v2 .topic.society { color:var(--red); } .nd-v2 .topic.culture,.nd-v2 .topic.entertainment { color:var(--violet); }
     .nd-v2 .heat { width:54px; height:54px; border-radius:50%; border:4px solid var(--line); display:flex; align-items:center; justify-content:center; font-family:"JetBrains Mono", Consolas, monospace; font-weight:800; color:var(--green); }
-    .nd-v2 .issue-card h3 { margin:0; font-size:17px; line-height:1.38; letter-spacing:-.015em; }
-    .nd-v2 .issue-card p { margin:0; font-size:12px; color:var(--ink2); line-height:1.55; }
-    .nd-v2 .why { margin-top:auto; padding-top:10px; border-top:1px dashed var(--line2); font-size:11px; color:var(--ink3); line-height:1.55; }
+    .nd-v2 .issue-card h3 { margin:0; font-size:19px; line-height:1.38; letter-spacing:-.015em; }
+    .nd-v2 .issue-card p { margin:0; font-size:14px; color:var(--ink2); line-height:1.6; }
+    .nd-v2 .why { margin-top:auto; padding-top:10px; border-top:1px dashed var(--line2); font-size:13px; color:var(--ink3); line-height:1.6; }
     .nd-v2 .why b { color:var(--green); font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.16em; }
     .nd-v2 .mini-metrics { display:flex; gap:18px; padding-top:10px; border-top:1px dashed var(--line2); }
     .nd-v2 .mini-lbl { font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.14em; color:var(--ink3); text-transform:uppercase; }
@@ -1254,17 +1275,17 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     .nd-v2 .heatmap { overflow-x:auto; }
     .nd-v2 .hm { display:grid; grid-template-columns:220px repeat(var(--press-count), minmax(28px, 1fr)); gap:2px; min-width:920px; }
     .nd-v2 .hm-head { font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.12em; color:var(--ink3); align-self:end; }
-    .nd-v2 .hpress { height:88px; writing-mode:vertical-rl; transform:rotate(180deg); font-size:10px; color:var(--ink2); text-align:right; }
-    .nd-v2 .hpress.base { color:var(--amber); font-weight:800; }
-    .nd-v2 .ilabel { display:flex; gap:8px; align-items:center; padding:6px 8px 6px 0; font-size:11px; line-height:1.3; }
+    .nd-v2 .hpress { height:96px; writing-mode:vertical-rl; transform:none; font-size:12px; color:var(--ink2); text-align:left; }
+    .nd-v2 .hpress.base { color:var(--ink); font-size:14px; font-weight:900; background:rgba(160,105,19,.18); border:1px solid rgba(160,105,19,.35); }
+    .nd-v2 .ilabel { display:flex; gap:8px; align-items:center; padding:6px 8px 6px 0; font-size:13px; line-height:1.35; }
     .nd-v2 .ilabel .num { color:var(--green); font-family:"JetBrains Mono", Consolas, monospace; }
     .nd-v2 .cell { aspect-ratio:1; background:var(--panel); display:flex; align-items:center; justify-content:center; font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; color:var(--ink3); }
     .nd-v2 .cell.l1 { background:rgba(47,125,90,.14); color:var(--green); } .nd-v2 .cell.l2 { background:rgba(47,125,90,.42); color:var(--ink); } .nd-v2 .cell.l3 { background:var(--green); color:#fff; font-weight:800; }
     .nd-v2 .alerts { display:flex; flex-direction:column; gap:1px; background:var(--line2); }
     .nd-v2 .alert { display:grid; grid-template-columns:110px 1fr; gap:18px; padding:15px 18px; background:var(--bg); border-left:2px solid var(--red); }
     .nd-v2 .alert-tag { font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; color:var(--red); letter-spacing:.18em; }
-    .nd-v2 .alert-title { font-size:15px; font-weight:800; margin-bottom:6px; }
-    .nd-v2 .alert-meta { font-size:12px; color:var(--ink2); line-height:1.55; }
+    .nd-v2 .alert-title { font-size:17px; font-weight:800; margin-bottom:6px; }
+    .nd-v2 .alert-meta { font-size:14px; color:var(--ink2); line-height:1.6; }
     .nd-v2 .alert-meta .lbl { color:var(--ink3); margin-right:6px; font-family:"JetBrains Mono", Consolas, monospace; }
     .nd-v2 .press-table { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1px; background:var(--line2); }
     .nd-v2 .press-col { background:var(--bg); }
@@ -1273,7 +1294,7 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     .nd-v2 .press-name { font-weight:800; display:flex; gap:8px; align-items:center; }
     .nd-v2 .base { font-family:"JetBrains Mono", Consolas, monospace; font-size:8px; padding:2px 5px; background:var(--amber); color:#000; }
     .nd-v2 .story-list { padding:8px 14px 14px; }
-    .nd-v2 .story { display:flex; gap:8px; padding:4px 0; color:var(--ink2); font-size:12px; line-height:1.45; }
+    .nd-v2 .story { display:flex; gap:8px; padding:5px 0; color:var(--ink2); font-size:14px; line-height:1.5; }
     .nd-v2 .story .bullet { color:var(--green); flex:0 0 auto; }
     .nd-v2 .issue-card h3,
     .nd-v2 .issue-card p,
@@ -1304,14 +1325,16 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
         why = safe_html(issue.get("why_it_matters"), "중요도 판단 정보 없음")
         heat = issue_heat(issue)
         coverage = issue_coverage(issue)
-        issue_cards.append(f"""
-        <div class="issue-card"><div class="topic-line {cat_class}"></div>
-          <div class="issue-top"><div><div class="rank mono">ISSUE #{html.escape(str(rank)).zfill(2)}</div><span class="topic {cat_class}">{html.escape(category)}</span></div><div class="heat">{heat}</div></div>
-          <h3>{title}</h3><p>{summary_text}</p>
-          <div class="mini-metrics"><div><div class="mini-lbl">Coverage</div><div class="mini-val">{coverage}<span style="color:var(--ink3);font-size:11px">/{len(URLS)}</span></div></div><div><div class="mini-lbl">Heat</div><div class="mini-val">{heat}</div></div></div>
-          <div class="why"><b>WHY</b> {why}</div>
-        </div>
-        """)
+        issue_cards.append(
+            f'<div class="issue-card"><div class="topic-line {cat_class}"></div>'
+            f'<div class="issue-top"><div><div class="rank mono">ISSUE #{html.escape(str(rank)).zfill(2)}</div>'
+            f'<span class="topic {cat_class}">{html.escape(category)}</span></div><div class="heat">{heat}</div></div>'
+            f'<h3>{title}</h3><p>{summary_text}</p>'
+            f'<div class="mini-metrics"><div><div class="mini-lbl">Coverage</div>'
+            f'<div class="mini-val">{coverage}<span style="color:var(--ink3);font-size:11px">/{len(URLS)}</span></div></div>'
+            f'<div><div class="mini-lbl">Heat</div><div class="mini-val">{heat}</div></div></div>'
+            f'<div class="why"><b>WHY</b> {why}</div></div>'
+        )
     if not issue_cards:
         issue_cards.append('<div class="empty">저장된 AI 이슈 분석 결과가 아직 없습니다.</div>')
 
@@ -1334,13 +1357,13 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     missed_html = []
     for idx, item in enumerate(missed_articles[:5], start=1):
         rank = item.get("rank", idx)
-        missed_html.append(f"""
-        <div class="alert"><div class="alert-tag">MISSED #{html.escape(str(rank))}</div><div>
-          <div class="alert-title">{safe_html(item.get('issue_title'), '이슈명 없음')}</div>
-          <div class="alert-meta"><span class="lbl">REASON</span>{safe_html(item.get('why_missed'))}</div>
-          <div class="alert-meta" style="margin-top:4px"><span class="lbl">SIGNAL</span>{safe_html(item.get('coverage_signal'))}</div>
-        </div></div>
-        """)
+        missed_html.append(
+            f'<div class="alert"><div class="alert-tag">MISSED #{html.escape(str(rank))}</div><div>'
+            f'<div class="alert-title">{safe_html(item.get("issue_title"), "이슈명 없음")}</div>'
+            f'<div class="alert-meta"><span class="lbl">REASON</span>{safe_html(item.get("why_missed"))}</div>'
+            f'<div class="alert-meta" style="margin-top:4px"><span class="lbl">SIGNAL</span>{safe_html(item.get("coverage_signal"))}</div>'
+            f'</div></div>'
+        )
     if not missed_html:
         missed_html.append(f'<div class="empty">현재 기준으로 {html.escape(TARGET_PRESS)}가 뚜렷하게 놓친 주요 이슈는 발견되지 않았습니다.</div>')
 
@@ -1348,28 +1371,33 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     for idx, (press, articles) in enumerate(news_data.items(), start=1):
         base = '<span class="base">BASE</span>' if press == TARGET_PRESS else ''
         stories = []
-        for article in (articles or [])[:3]:
-            title = article.get("title", "")
+        for article in (articles or [])[:6]:
+            title = clean_article_title(article.get("title", ""))
+            if not title:
+                continue
             url = article.get("url")
             content = f'<a href="{html.escape(str(url))}" target="_blank">{html.escape(title)}</a>' if url else html.escape(title)
             stories.append(f'<div class="story"><span class="bullet">›</span><span>{content}</span></div>')
         if not stories:
             stories.append('<div class="story"><span class="bullet">›</span><span>최신 뉴스를 불러오지 못했습니다.</span></div>')
-        press_html.append(f"""
-        <div class="press-col"><div class="press-row"><span class="press-idx">{idx:02d}</span><span class="press-name">{html.escape(str(press))}{base}</span><span class="mono" style="color:var(--ink3);text-align:right">{len(articles or [])}</span></div><div class="story-list">{''.join(stories)}</div></div>
-        """)
+        press_html.append(
+            f'<div class="press-col"><div class="press-row"><span class="press-idx">{idx:02d}</span>'
+            f'<span class="press-name">{html.escape(str(press))}{base}</span>'
+            f'<span class="mono" style="color:var(--ink3);text-align:right">{len(articles or [])}</span></div>'
+            f'<div class="story-list">{"".join(stories)}</div></div>'
+        )
 
     error_html = f'<div class="empty" style="margin-bottom:12px">{safe_html(ai_data.get("error"))}</div>' if ai_data.get("error") else ""
     st.markdown(css + f"""
     <div class="nd-v2">
       <div class="topnav"><div style="display:flex;align-items:center"><div class="brand mono">NEWSDESK TERMINAL</div><div class="tabs mono"><div class="tab active">DASHBOARD</div><div class="tab">ISSUES</div><div class="tab">COVERAGE</div><div class="tab">KEYWORDS</div></div></div><div class="status mono"><span class="live">LIVE</span><span>REFRESH 10MIN</span><span>{html.escape(format_refresh_slot(refresh_slot))}</span></div></div>
-      <div class="hero"><div><div class="eyebrow mono">NEWS TREND BRIEF / KST</div><h1>오늘의 <span>뉴스 시그널</span></h1><div class="sub">주요 언론사의 네이버 뉴스 제목과 저장된 AI 분석 결과를 한 화면에서 확인합니다. 기준 매체는 <b>{html.escape(TARGET_PRESS)}</b>입니다.</div></div>
+      <div class="hero"><div><div class="eyebrow mono">NEWS TREND BRIEF / KST</div><h1>실시간 네이버 <span>뉴스 현황</span></h1><div class="sub">주요 언론사의 네이버 뉴스 제목과 저장된 AI 분석 결과를 한 화면에서 확인합니다. 기준 매체는 <b>{html.escape(TARGET_PRESS)}</b>입니다.</div></div>
         <div class="metrics"><div class="metric"><div class="lbl">Tracked</div><div class="val">{len(news_data)}<span style="font-size:11px;color:var(--ink3)"> outlets</span></div><div class="subv">{total_headlines} headlines</div></div><div class="metric"><div class="lbl">Issues</div><div class="val green">{len(issues[:6]):02d}</div><div class="subv">AI selected</div></div><div class="metric"><div class="lbl">Missed</div><div class="val amber">{len(missed_articles[:5]):02d}</div><div class="subv">vs. {html.escape(TARGET_PRESS)}</div></div><div class="metric"><div class="lbl">AI Calls</div><div class="val">{html.escape(str(today_ai_calls))}<span style="font-size:11px;color:var(--ink3)"> / 400</span></div><div class="subv">{html.escape(last_model)}</div></div></div></div>
-      <div class="main-grid"><div class="panel"><div class="panel-head"><h2>AI 에디터의 오늘 흐름</h2><span class="meta">UPDATED {html.escape(last_analysis)}</span></div>{error_html}<div class="flow">{safe_html(summary.get('overall_trend'), '저장된 AI 분석 결과가 아직 없습니다.')}</div><div class="note"><div class="badge">EDIT<br>NOTE</div><div>{safe_html(summary.get('editorial_note'), '편집 방향 제안이 아직 없습니다.')}</div></div></div><div class="panel"><div class="panel-head"><h2>키워드 빈도</h2><span class="meta">N={total_headlines}</span></div><div class="kw-list">{''.join(kw_html)}</div></div></div>
+      <div class="main-grid"><div class="panel"><div class="panel-head"><h2>AI 에디터의 흐름 분석</h2><span class="meta">UPDATED {html.escape(last_analysis)}</span></div>{error_html}<div class="flow">{safe_html(summary.get('overall_trend'), '저장된 AI 분석 결과가 아직 없습니다.')}</div><div class="note"><div class="badge">EDIT<br>NOTE</div><div>{safe_html(summary.get('editorial_note'), '편집 방향 제안이 아직 없습니다.')}</div></div></div><div class="panel"><div class="panel-head"><h2>키워드 빈도</h2><span class="meta">N={total_headlines}</span></div><div class="kw-list">{''.join(kw_html)}</div></div></div>
       <div class="panel full"><div class="panel-head"><h2>핵심 이슈 / HEAT × COVERAGE</h2><span class="meta">6 ISSUES</span></div><div class="issue-grid">{''.join(issue_cards)}</div></div>
       <div class="panel full"><div class="panel-head"><h2>이슈 × 언론사 보도 매트릭스</h2><span class="meta">DARKER = MORE COVERAGE</span></div><div class="heatmap"><div class="hm" style="--press-count:{max(len(presses),1)}">{''.join(hm_cells)}</div></div></div>
       <div class="panel full"><div class="panel-head"><h2>국민일보가 놓친 기사</h2><span class="meta">DETECTED IN OTHER OUTLETS</span></div><div class="alerts">{''.join(missed_html)}</div></div>
-      <div class="panel full"><div class="panel-head"><h2>언론사별 리드 헤드라인</h2><span class="meta">TOP 3 PER OUTLET</span></div><div class="press-table">{''.join(press_html)}</div></div>
+      <div class="panel full"><div class="panel-head"><h2>언론사별 헤드라인</h2><span class="meta">TOP 6 PER OUTLET</span></div><div class="press-table">{''.join(press_html)}</div></div>
     </div>
     """, unsafe_allow_html=True)
 

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
-PRIMARY_MODEL_NAME = "gemini-3.1-flash-lite"
+PRIMARY_MODEL_NAME = "gemini-2.5-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
 SERVICE_UNAVAILABLE_THRESHOLD = 2
 SERVICE_UNAVAILABLE_COOLDOWN_SECONDS = 30 * 60
@@ -24,19 +24,19 @@ AI_REFRESH_LOCK_TTL_SECONDS = 120
 MODEL_CHAIN = [
     {
         "provider": "gemini",
-        "model": "gemini-3.1-flash-lite",
+        "model": "gemini-2.5-flash-lite",
         "api_keys": ["GEMINI_API_KEY"],
         "rpm": 4_000,
-        "rpd": 150_000,
+        "rpd": None,
         "tpm": 4_000_000,
         "tpd": None,
     },
     {
         "provider": "gemini",
-        "model": "gemini-2.5-flash-lite",
+        "model": "gemini-3.1-flash-lite",
         "api_keys": ["GEMINI_API_KEY"],
         "rpm": 4_000,
-        "rpd": None,
+        "rpd": 150_000,
         "tpm": 4_000_000,
         "tpd": None,
     },

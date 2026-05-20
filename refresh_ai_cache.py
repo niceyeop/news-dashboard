@@ -598,6 +598,16 @@ def parse_gemini_json(text):
     return None
 
 
+def build_json_only_retry_prompt(base_prompt):
+    return (
+        f"{base_prompt}\n\n"
+        "CRITICAL OUTPUT RULE:\n"
+        "- Return exactly one valid JSON object.\n"
+        "- Do not include markdown, code fences, explanations, or extra text.\n"
+        "- The first character must be '{' and the last character must be '}'.\n"
+    )
+
+
 def is_probably_html(text):
     if not text:
         return False
@@ -1006,21 +1016,28 @@ def refresh_ai_for_current_slot():
                 continue
 
             max_attempts = 2 if model_config["provider"] == "gemini" else 1
+            model_prompt = prompt
 
             for attempt_number in range(1, max_attempts + 1):
-                limit_error = reserve_model_capacity(prompt, refresh_slot, model_config)
+                limit_error = reserve_model_capacity(model_prompt, refresh_slot, model_config)
                 if limit_error:
                     record_model_attempt(refresh_slot, model_config, attempt_number, "skipped", limit_error)
                     attempt_errors.append(limit_error)
                     break
 
                 try:
-                    response_text = call_model(model_config, api_key, prompt)
+                    response_text = call_model(model_config, api_key, model_prompt)
                     parsed = parse_gemini_json(response_text)
                     if parsed is None:
                         error = f"{model_name}: failed to parse JSON response"
                         record_model_attempt(refresh_slot, model_config, attempt_number, "failed", error)
                         attempt_errors.append(error)
+                        if attempt_number < max_attempts:
+                            retry_note = f"{model_name}: retrying with JSON-only prompt after parse failure"
+                            record_model_attempt(refresh_slot, model_config, attempt_number + 1, "retrying", retry_note)
+                            print(retry_note)
+                            model_prompt = build_json_only_retry_prompt(prompt)
+                            continue
                         break
 
                     save_ai_result(refresh_slot, sanitize_ai_payload(parsed), model_name)

@@ -529,22 +529,66 @@ def clean_model_text(text):
     return cleaned
 
 
+def extract_first_json_object(text):
+    if not text:
+        return ""
+
+    start = text.find("{")
+    if start == -1:
+        return ""
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx in range(start, len(text)):
+        ch = text[idx]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+
+    return ""
+
+
 def parse_gemini_json(text):
     if not text:
         return None
 
     cleaned = clean_model_text(text)
+    cleaned = cleaned.replace("\ufeff", "").strip()
 
     try:
         return json.loads(cleaned)
     except Exception:
         pass
 
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
-    if start != -1 and end != -1 and end > start:
-        json_candidate = cleaned[start:end + 1]
+    json_candidate = extract_first_json_object(cleaned)
+    if json_candidate:
         json_candidate = re.sub(r",\s*([}\]])", r"\1", json_candidate)
         try:
             return json.loads(json_candidate)

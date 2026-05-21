@@ -19,6 +19,10 @@ st.set_page_config(page_title="주요 언론사 뉴스 대시보드", page_icon=
 TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+MODEL_DAILY_LIMITS = {
+    "gemini-3.1-flash-lite": 500,
+    "gemma-4-31b-it": 1500,
+}
 REFRESH_INTERVAL_MINUTES = 10
 UI_POLL_INTERVAL_MS = 15 * 1000
 AI_CACHE_DIR = Path(os.getenv("NEWS_DASHBOARD_CACHE_DIR", ".news_dashboard_cache"))
@@ -1274,6 +1278,7 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     last_analysis = format_timestamp(dashboard_stats.get("last_generated_at"))
     last_model = dashboard_stats.get("last_model") or "-"
     today_ai_calls = dashboard_stats.get("today_ai_calls", 0)
+    display_daily_limit = MODEL_DAILY_LIMITS.get(last_model, 500)
 
     css = """
     <style>
@@ -1450,7 +1455,7 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     <div class="nd-v2">
       <div class="topnav"><div style="display:flex;align-items:center"><div class="brand mono">NEWSDESK TERMINAL</div><div class="tabs mono"><div class="tab active">DASHBOARD</div><div class="tab">ISSUES</div><div class="tab">COVERAGE</div><div class="tab">KEYWORDS</div></div></div><div class="status mono"><span class="live">LIVE</span><span>REFRESH 10MIN</span><span>{html.escape(format_refresh_slot(refresh_slot))}</span></div></div>
       <div class="hero"><div><div class="eyebrow mono">NEWS TREND BRIEF / KST</div><h1>실시간 네이버 <span>뉴스 현황</span></h1><div class="sub">주요 언론사의 네이버 뉴스 제목과 저장된 AI 분석 결과를 한 화면에서 확인합니다. 기준 매체는 <b>{html.escape(TARGET_PRESS)}</b>입니다.</div></div>
-        <div class="metrics"><div class="metric"><div class="lbl">Tracked</div><div class="val">{len(news_data)}<span style="font-size:11px;color:var(--ink3)"> outlets</span></div><div class="subv">{total_headlines} headlines</div></div><div class="metric"><div class="lbl">Issues</div><div class="val green">{len(issues[:6]):02d}</div><div class="subv">AI selected</div></div><div class="metric"><div class="lbl">Missed</div><div class="val amber">{len(missed_articles[:5]):02d}</div><div class="subv">vs. {html.escape(TARGET_PRESS)}</div></div><div class="metric"><div class="lbl">AI Calls</div><div class="val">{html.escape(str(today_ai_calls))}<span style="font-size:11px;color:var(--ink3)"> / 400</span></div><div class="subv">{html.escape(last_model)}</div></div></div></div>
+        <div class="metrics"><div class="metric"><div class="lbl">Tracked</div><div class="val">{len(news_data)}<span style="font-size:11px;color:var(--ink3)"> outlets</span></div><div class="subv">{total_headlines} headlines</div></div><div class="metric"><div class="lbl">Issues</div><div class="val green">{len(issues[:6]):02d}</div><div class="subv">AI selected</div></div><div class="metric"><div class="lbl">Missed</div><div class="val amber">{len(missed_articles[:5]):02d}</div><div class="subv">vs. {html.escape(TARGET_PRESS)}</div></div><div class="metric"><div class="lbl">AI Calls</div><div class="val">{html.escape(str(today_ai_calls))}<span style="font-size:11px;color:var(--ink3)"> / {display_daily_limit}</span></div><div class="subv">{html.escape(last_model)}</div></div></div></div>
       <div class="main-grid"><div class="panel"><div class="panel-head"><h2>AI 에디터의 흐름 분석</h2><span class="meta">UPDATED {html.escape(last_analysis)}</span></div>{error_html}<div class="flow">{safe_html(summary.get('overall_trend'), '저장된 AI 분석 결과가 아직 없습니다.')}</div><div class="note"><div class="badge">EDIT<br>NOTE</div><div>{safe_html(summary.get('editorial_note'), '편집 방향 제안이 아직 없습니다.')}</div></div></div><div class="panel"><div class="panel-head"><h2>키워드 빈도</h2><span class="meta">N={total_headlines}</span></div><div class="kw-list">{''.join(kw_html)}</div></div></div>
       <div class="panel full"><div class="panel-head"><h2>핵심 이슈 / HEAT × COVERAGE</h2><span class="meta">6 ISSUES</span></div><div class="issue-grid">{''.join(issue_cards)}</div></div>
       <div class="panel full"><div class="panel-head"><h2>이슈 × 언론사 보도 매트릭스</h2><span class="meta">DARKER = MORE COVERAGE</span></div><div class="heatmap"><div class="hm" style="--press-count:{max(len(presses),1)}">{''.join(hm_cells)}</div></div></div>

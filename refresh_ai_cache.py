@@ -26,19 +26,21 @@ MODEL_CHAIN = [
         "provider": "gemini",
         "model": "gemini-3.1-flash-lite",
         "api_keys": ["GEMINI_API_KEY"],
-        "rpm": 4_000,
-        "rpd": 150_000,
-        "tpm": 4_000_000,
+        "rpm": 15,
+        "rpd": 500,
+        "tpm": 250_000,
         "tpd": None,
+        "max_attempts": 3,
     },
     {
         "provider": "gemini",
-        "model": "gemini-2.5-flash-lite",
+        "model": "gemma-4-31b-it",
         "api_keys": ["GEMINI_API_KEY"],
-        "rpm": 4_000,
-        "rpd": None,
-        "tpm": 4_000_000,
+        "rpm": 15,
+        "rpd": 1_500,
+        "tpm": 10**12,
         "tpd": None,
+        "max_attempts": 1,
     },
 ]
 
@@ -1003,19 +1005,7 @@ def refresh_ai_for_current_slot():
                 attempt_errors.append(error)
                 continue
 
-            daily_quota_block_reason = get_daily_quota_block_reason(model_name)
-            if daily_quota_block_reason:
-                record_model_attempt(refresh_slot, model_config, 0, "skipped", daily_quota_block_reason)
-                attempt_errors.append(daily_quota_block_reason)
-                continue
-
-            service_unavailable_cooldown_reason = get_service_unavailable_cooldown_reason(model_name)
-            if service_unavailable_cooldown_reason:
-                record_model_attempt(refresh_slot, model_config, 0, "skipped", service_unavailable_cooldown_reason)
-                attempt_errors.append(service_unavailable_cooldown_reason)
-                continue
-
-            max_attempts = 2 if model_config["provider"] == "gemini" else 1
+            max_attempts = int(model_config.get("max_attempts", 1))
             model_prompt = prompt
 
             for attempt_number in range(1, max_attempts + 1):
@@ -1041,7 +1031,6 @@ def refresh_ai_for_current_slot():
                         break
 
                     save_ai_result(refresh_slot, sanitize_ai_payload(parsed), model_name)
-                    clear_service_unavailable_state(model_name)
                     record_model_attempt(refresh_slot, model_config, attempt_number, "success")
                     record_slot_attempt(refresh_slot, "success", model_name)
                     print(f"AI cache refreshed for slot: {refresh_slot} via {model_name}")
@@ -1052,24 +1041,10 @@ def refresh_ai_for_current_slot():
 
                     if is_daily_quota_exceeded_error(exc):
                         quota_reason = build_daily_quota_block_reason(model_name, exc)
-                        set_scheduler_state(model_state_key(model_name, "quota_blocked_day"), get_kst_day_key())
-                        set_scheduler_state(model_state_key(model_name, "quota_block_reason"), quota_reason)
                         attempt_errors.append(quota_reason)
                         break
 
-                    if is_service_unavailable_error(exc):
-                        cooldown_reason = record_service_unavailable_and_maybe_cooldown(model_name, exc)
-                        attempt_errors.append(cooldown_reason)
-                        if attempt_number < max_attempts:
-                            time.sleep(5)
-                            continue
-                        break
-
-                    if (
-                        model_config["provider"] == "gemini"
-                        and is_transient_retryable_error(exc)
-                        and attempt_number < max_attempts
-                    ):
+                    if attempt_number < max_attempts:
                         time.sleep(5)
                         continue
 

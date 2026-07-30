@@ -18,10 +18,10 @@ st.set_page_config(page_title="주요 언론사 뉴스 대시보드", page_icon=
 
 TARGET_PRESS = "국민일보"
 AI_CACHE_VERSION = "minimal-fields-v1"
-GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
 MODEL_DAILY_LIMITS = {
+    "gemini-3.5-flash-lite": 500,
     "gemini-3.1-flash-lite": 500,
-    "gemma-4-31b-it": 1500,
 }
 REFRESH_INTERVAL_MINUTES = 10
 UI_POLL_INTERVAL_MS = 15 * 1000

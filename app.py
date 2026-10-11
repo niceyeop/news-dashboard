@@ -1,5 +1,4 @@
 import streamlit as st
-import requests
 from bs4 import BeautifulSoup
 from collections import Counter
 from contextlib import closing
@@ -17,7 +16,7 @@ from streamlit_autorefresh import st_autorefresh
 st.set_page_config(page_title="주요 언론사 뉴스 대시보드", page_icon="📰", layout="wide")
 
 TARGET_PRESS = "국민일보"
-AI_CACHE_VERSION = "minimal-fields-v1"
+AI_CACHE_VERSION = "daily-coverage-v1"
 GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
 MODEL_DAILY_LIMITS = {
     "gemini-3.5-flash-lite": 500,
@@ -548,16 +547,6 @@ URLS = {
 }
 
 
-def normalize_url(url):
-    if not url:
-        return None
-    if url.startswith("http"):
-        return url
-    if url.startswith("/"):
-        return "https://media.naver.com" + url
-    return url
-
-
 def clean_article_title(value):
     title = to_plain_display_text(value)
     title = re.sub(r"\s+", " ", title).strip()
@@ -579,83 +568,6 @@ def clean_article_title(value):
     if len(title) > 180:
         return ""
     return title
-
-
-def collect_news():
-    results = {}
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
-
-    for name, url in URLS.items():
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            r.encoding = "utf-8"
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            articles = []
-
-            title_nodes = soup.select(".press_news_text")
-
-            for node in title_nodes:
-                title = clean_article_title(node.get_text(" ", strip=True))
-                if not title:
-                    continue
-
-                a_tag = node.find_parent("a")
-                article_url = normalize_url(a_tag.get("href")) if a_tag else None
-
-                if title not in [a["title"] for a in articles]:
-                    articles.append({
-                        "title": title,
-                        "url": article_url
-                    })
-
-            if not articles:
-                title_nodes = soup.select(".cjs_t")
-
-                for node in title_nodes:
-                    title = clean_article_title(node.get_text(" ", strip=True))
-                    if not title:
-                        continue
-
-                    a_tag = node.find_parent("a")
-                    article_url = normalize_url(a_tag.get("href")) if a_tag else None
-
-                    if title not in [a["title"] for a in articles]:
-                        articles.append({
-                            "title": title,
-                            "url": article_url
-                        })
-
-            if not articles:
-                link_nodes = soup.select("a[href*='/article/']")
-
-                for a_tag in link_nodes:
-                    title = clean_article_title(a_tag.get_text(" ", strip=True))
-                    article_url = normalize_url(a_tag.get("href"))
-
-                    if len(title) >= 8 and title not in [a["title"] for a in articles]:
-                        articles.append({
-                            "title": title,
-                            "url": article_url
-                        })
-
-            results[name] = articles[:6]
-
-        except Exception:
-            results[name] = [{
-                "title": "데이터를 불러올 수 없습니다.",
-                "url": None
-            }]
-
-    return results
-
-
-@st.cache_data
-def fetch_news(refresh_slot):
-    return collect_news()
 
 
 def flatten_news_titles(news_data):
@@ -921,12 +833,11 @@ def parse_gemini_json(text):
 
 def get_stored_ai_insight():
     cached_result = get_cached_ai_result()
-    if isinstance(cached_result, dict) and cached_result.get("data"):
+    if cached_result.get("data") and cached_result.get("cache_version") == AI_CACHE_VERSION:
         return cached_result["data"]
 
     return {
-        "error": "저장된 AI 분석 결과가 아직 없습니다. 별도 스케줄러가 DB를 갱신한 뒤 표시됩니다.",
-        "raw": None
+        "error": "하루 누적 비교 분석의 첫 결과를 기다리는 중입니다. 스케줄러가 다음 10분 슬롯에 갱신합니다.",
     }
 
 
@@ -1088,109 +999,13 @@ def safe_html(value, fallback=""):
     return html.escape(str(text))
 
 
-def truncate_text(value, limit=90):
-    text = to_plain_display_text(value)
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 1)].rstrip() + "…"
+def format_exposure(slots):
+    minutes = int(round(float(slots or 0) * REFRESH_INTERVAL_MINUTES))
+    if minutes < 60:
+        return f"{minutes}분"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours}시간 {rest}분" if rest else f"{hours}시간"
 
-
-def issue_heat(issue):
-    scores = issue.get("scores") if isinstance(issue, dict) else None
-    if isinstance(scores, dict) and scores:
-        values = []
-        for value in scores.values():
-            try:
-                values.append(float(value))
-            except (TypeError, ValueError):
-                pass
-        if values:
-            return max(1, min(100, int(round(sum(values) / len(values) * 20))))
-    return 70
-
-
-def normalize_match_text(value):
-    text = to_plain_display_text(value).lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def issue_match_terms(issue, max_terms=8):
-    if not isinstance(issue, dict):
-        return []
-
-    source_text = " ".join(
-        [
-            to_plain_display_text(issue.get("issue_title", "")),
-            to_plain_display_text(issue.get("one_line_summary", "")),
-            to_plain_display_text(issue.get("why_it_matters", "")),
-        ]
-    )
-    normalized = normalize_match_text(source_text)
-    if not normalized:
-        return []
-
-    stopwords = {
-        "관련",
-        "논란",
-        "보도",
-        "기사",
-        "이슈",
-        "정부",
-        "대한",
-        "현재",
-        "분석",
-        "핵심",
-    }
-    terms = []
-    for token in normalized.split():
-        if len(token) < 2 or token.isdigit() or token in stopwords:
-            continue
-        if token not in terms:
-            terms.append(token)
-        if len(terms) >= max_terms:
-            break
-    return terms
-
-
-def issue_coverage(issue, news_data):
-    terms = issue_match_terms(issue)
-    matched_presses = set()
-
-    for press, articles in (news_data or {}).items():
-        for article in articles or []:
-            article_title = normalize_match_text(article.get("title", ""))
-            if article_title and any(term in article_title for term in terms):
-                matched_presses.add(press)
-                break
-
-    if matched_presses:
-        return min(len(matched_presses), len(URLS))
-
-    related = issue.get("related_articles", []) if isinstance(issue, dict) else []
-    medias = {to_plain_display_text(a.get("media")) for a in related if isinstance(a, dict) and a.get("media")}
-    return min(len(medias) or len(related), len(URLS))
-
-
-
-def display_category(category):
-    category = to_plain_display_text(category) or "기타"
-    mapping = {
-        "politics": "정치",
-        "economy": "경제",
-        "society": "사회",
-        "global": "국제",
-        "international": "국제",
-        "life": "생활",
-        "tech": "IT·과학",
-        "culture": "문화",
-        "sports": "스포츠",
-        "entertainment": "연예",
-        "opinion": "오피니언",
-        "etc": "기타",
-    }
-    return mapping.get(category.lower(), category) if isinstance(category, str) else "기타"
 
 def category_class(category):
     category = to_plain_display_text(category) or "기타"
@@ -1202,78 +1017,64 @@ def category_class(category):
         "생활": "life",
         "IT·과학": "tech",
         "문화": "culture",
-        "스포츠": "sports",
-        "연예": "entertainment",
+        "스포츠·연예": "entertainment",
         "오피니언": "opinion",
     }
     return mapping.get(category, "etc")
 
 
-def flatten_valid_articles(news_data):
-    rows = []
-    for press, articles in (news_data or {}).items():
-        for article in articles or []:
-            title = article.get("title", "") if isinstance(article, dict) else ""
-            if title and "데이터를 불러올 수 없습니다" not in title:
-                rows.append({"press": press, "title": title, "url": article.get("url")})
-    return rows
+STATUS_CLASS = {"누락": "missing", "소홀": "weak", "보도": "covered"}
 
 
-def keyword_rows(summary, news_data):
-    keywords = [to_plain_display_text(k) for k in (summary.get("top_keywords", []) or [])]
-    keywords = [k for k in keywords if k]
-    titles = [row["title"] for row in flatten_valid_articles(news_data)]
+def load_today_press_articles(day_key, per_press=8):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_articles'"
+        ).fetchone()
+        if not table_exists:
+            return {press: [] for press in URLS}, {}
+        rows = conn.execute(
+            """
+            SELECT press, title, url, seen_count FROM daily_articles
+            WHERE day_key = ? ORDER BY seen_count DESC, first_seen ASC
+            """,
+            (day_key,),
+        ).fetchall()
 
-    if not keywords:
-        counter = Counter()
-        stopwords = {"속보", "단독", "뉴스", "오늘", "관련", "기자", "논란", "종합", "영상", "포토"}
-        for title in titles:
-            for word in re.sub(r"[^\w\s]", " ", title).split():
-                if len(word) > 1 and word not in stopwords and not word.isdigit():
-                    counter[word] += 1
-        keywords = [word for word, _ in counter.most_common(8)]
-
-    rows = []
-    for keyword in keywords[:8]:
-        count = sum(1 for title in titles if keyword in title)
-        rows.append({"keyword": keyword, "count": count or 1})
-    return rows
-
-
-def build_heatmap(issues, news_data):
-    presses = list((news_data or {}).keys())
-    matrix = []
-    for issue in issues[:6]:
-        terms = issue_match_terms(issue)
-        row = []
-        for press in presses:
-            score = 0
-            for article in news_data.get(press, []) or []:
-                article_title = normalize_match_text(article.get("title", ""))
-                if article_title and any(term in article_title for term in terms):
-                    score += 1
-            row.append(min(score, 3))
-        matrix.append(row)
-    return presses, matrix
+    articles = {press: [] for press in URLS}
+    counts = Counter()
+    for row in rows:
+        counts[row["press"]] += 1
+        bucket = articles.setdefault(row["press"], [])
+        if len(bucket) < per_press:
+            bucket.append({"title": row["title"], "url": row["url"], "seen_count": int(row["seen_count"])})
+    return articles, counts
 
 
-def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
-    if isinstance(ai_data, str):
-        parsed = parse_gemini_json(clean_model_text(ai_data))
-        ai_data = parsed or {"error": "AI 응답 형식이 올바르지 않습니다."}
+def article_link_html(article, show_media=False):
+    title = clean_article_title(article.get("title", "")) or to_plain_display_text(article.get("title", ""))
+    url = str(article.get("url") or "")
+    text = html.escape(title)
+    if url.startswith("http"):
+        text = f'<a href="{html.escape(url)}" target="_blank">{text}</a>'
+    media = f'<span class="ref-media">{safe_html(article.get("media"))}</span>' if show_media else ""
+    exposure = f'<span class="ref-exp mono">{format_exposure(article.get("seen_count", 0))}</span>'
+    return f'<div class="story"><span class="bullet">›</span>{media}<span class="story-title">{text}</span>{exposure}</div>'
+
+
+def render_dashboard(ai_data, press_articles, press_counts, dashboard_stats, refresh_slot):
     if not isinstance(ai_data, dict):
         ai_data = {"error": "AI 분석 결과 형식이 올바르지 않습니다."}
 
-    ai_data = sanitize_ai_payload(ai_data)
-    summary = ai_data.get("dashboard_summary", {}) or {}
-    issues = ai_data.get("issues", []) or []
-    missed_articles = ai_data.get("missed_articles", []) or []
-    news_data = news_data or {}
-
-    keywords = keyword_rows(summary, news_data)
-    max_keyword_count = max([row["count"] for row in keywords] or [1])
-    total_headlines = len(flatten_valid_articles(news_data))
-    presses, heatmap = build_heatmap(issues, news_data)
+    target = html.escape(TARGET_PRESS)
+    issues = [i for i in ai_data.get("issues", []) or [] if isinstance(i, dict)]
+    gaps = [i for i in issues if i.get("is_gap")]
+    missing_count = sum(1 for i in gaps if i.get("target_status") == "누락")
+    weak_count = len(gaps) - missing_count
+    gap_min_outlets = ai_data.get("gap_min_outlets", 3)
+    day_key = ai_data.get("day_key") or refresh_slot[:10]
+    article_total = sum(press_counts.values())
 
     last_analysis = format_timestamp(dashboard_stats.get("last_generated_at"))
     last_model = dashboard_stats.get("last_model") or "-"
@@ -1290,177 +1091,160 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
     .nd-v2 .mono { font-family:"JetBrains Mono", Consolas, monospace; }
     .nd-v2 .topnav { display:flex; justify-content:space-between; align-items:center; padding:10px 16px; border:1px solid var(--line2); background:var(--panel); }
     .nd-v2 .brand { font-size:11px; letter-spacing:.22em; color:var(--green); font-weight:800; }
-    .nd-v2 .tabs { display:flex; gap:1px; background:var(--line); padding:1px; margin-left:24px; }
-    .nd-v2 .tab { padding:6px 12px; font-size:11px; letter-spacing:.12em; color:var(--ink2); background:var(--bg); }
-    .nd-v2 .tab.active { background:var(--green); color:#fff; }
-    .nd-v2 .status { display:flex; gap:16px; font-size:12px; color:var(--ink2); align-items:center; }
+    .nd-v2 .status-bar { display:flex; gap:16px; font-size:12px; color:var(--ink2); align-items:center; }
     .nd-v2 .live { color:var(--green); font-weight:800; }
     .nd-v2 .hero { display:grid; grid-template-columns:1.3fr 1fr; gap:28px; padding:28px 18px 22px; border-left:1px solid var(--line2); border-right:1px solid var(--line2); border-bottom:1px solid var(--line2); background:var(--bg); }
     .nd-v2 .eyebrow { font-size:10px; letter-spacing:.2em; color:var(--ink3); margin-bottom:12px; }
-    .nd-v2 h1 { margin:0; font-size:34px; line-height:1.12; letter-spacing:-.03em; }
-    .nd-v2 h1 span { color:var(--green); }
+    .nd-v2 h1 { margin:0; font-size:32px; line-height:1.18; letter-spacing:-.03em; }
+    .nd-v2 h1 .accent { color:var(--red); }
     .nd-v2 .sub { max-width:680px; margin-top:10px; color:var(--ink2); line-height:1.6; font-size:15px; }
     .nd-v2 .metrics { display:grid; grid-template-columns:repeat(4, 1fr); gap:1px; background:var(--line); border:1px solid var(--line2); align-self:start; }
     .nd-v2 .metric { background:var(--panel); padding:14px 12px; min-height:84px; }
-    .nd-v2 .metric .lbl { font-size:9px; letter-spacing:.16em; color:var(--ink3); text-transform:uppercase; }
+    .nd-v2 .metric .lbl { font-size:10px; letter-spacing:.06em; color:var(--ink3); }
     .nd-v2 .metric .val { margin-top:6px; font-family:"JetBrains Mono", Consolas, monospace; font-size:20px; font-weight:700; color:var(--ink); word-break:break-word; }
-    .nd-v2 .metric .val.green { color:var(--green); } .nd-v2 .metric .val.amber { color:var(--amber); }
+    .nd-v2 .metric .val.green { color:var(--green); } .nd-v2 .metric .val.red { color:var(--red); }
     .nd-v2 .metric .subv { margin-top:3px; font-size:10px; color:var(--ink3); }
-    .nd-v2 .main-grid { display:grid; grid-template-columns:minmax(0, 1fr) 380px; gap:1px; background:var(--line2); border-left:1px solid var(--line2); border-right:1px solid var(--line2); }
-    .nd-v2 .panel { background:var(--bg); padding:18px 20px; }
-    .nd-v2 .panel.full { border:1px solid var(--line2); border-top:0; }
+    .nd-v2 .panel { background:var(--bg); padding:18px 20px; border:1px solid var(--line2); border-top:0; }
     .nd-v2 .panel-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; padding-bottom:10px; border-bottom:1px dashed var(--line2); }
     .nd-v2 .panel-head h2 { margin:0; font-size:16px; letter-spacing:.02em; font-weight:800; }
-    .nd-v2 .panel-head .meta { font-family:"JetBrains Mono", Consolas, monospace; font-size:11px; color:var(--ink3); letter-spacing:.1em; }
+    .nd-v2 .panel-head .meta { font-family:"JetBrains Mono", Consolas, monospace; font-size:11px; color:var(--ink3); letter-spacing:.06em; }
     .nd-v2 .flow { font-size:16px; line-height:1.75; }
     .nd-v2 .note { display:flex; gap:14px; margin-top:14px; padding:14px; background:var(--panel); border-left:2px solid var(--amber); color:var(--ink2); font-size:14px; line-height:1.6; }
-    .nd-v2 .note .badge { flex:0 0 auto; font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; color:var(--amber); letter-spacing:.16em; }
-    .nd-v2 .kw-list { display:flex; flex-direction:column; gap:7px; }
-    .nd-v2 .kw-row { display:grid; grid-template-columns:82px 1fr 34px; gap:9px; align-items:center; font-family:"JetBrains Mono", Consolas, monospace; font-size:12px; }
-    .nd-v2 .kw-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink); }
-    .nd-v2 .bar { height:8px; background:var(--panel); } .nd-v2 .fill { display:block; height:100%; background:var(--green); }
-    .nd-v2 .issue-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; }
-    .nd-v2 .issue-card { position:relative; min-height:236px; padding:20px 22px; background:var(--panel); border:1px solid var(--line2); border-radius:4px; display:flex; flex-direction:column; gap:11px; overflow:hidden; }
+    .nd-v2 .note .badge { flex:0 0 auto; font-weight:800; font-size:12px; color:var(--amber); }
+    .nd-v2 .alerts { display:flex; flex-direction:column; gap:1px; background:var(--line2); }
+    .nd-v2 .alert { display:grid; grid-template-columns:120px 1fr; gap:18px; padding:16px 18px; background:var(--panel); border-left:3px solid var(--red); }
+    .nd-v2 .alert.weak { border-left-color:var(--amber); }
+    .nd-v2 .alert-tag { display:inline-block; padding:2px 8px; font-size:12px; font-weight:800; color:#fff; background:var(--red); border-radius:2px; }
+    .nd-v2 .alert.weak .alert-tag { background:var(--amber); }
+    .nd-v2 .alert-num { margin-top:8px; font-size:15px; font-weight:700; }
+    .nd-v2 .alert-sub { font-size:12px; color:var(--ink3); margin-top:2px; }
+    .nd-v2 .alert-title { font-size:17px; font-weight:800; margin-bottom:6px; }
+    .nd-v2 .alert-meta { font-size:14px; color:var(--ink2); line-height:1.6; margin-top:3px; }
+    .nd-v2 .alert-meta .lbl { color:var(--ink3); margin-right:8px; font-size:12px; font-weight:700; }
+    .nd-v2 .refs { margin-top:8px; padding-top:6px; border-top:1px dashed var(--line2); }
+    .nd-v2 .issue-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; align-items:stretch; }
+    .nd-v2 .issue-card { position:relative; padding:20px 22px; background:var(--panel); border:1px solid var(--line2); border-radius:4px; display:flex; flex-direction:column; gap:11px; overflow:hidden; }
     .nd-v2 .topic-line { position:absolute; right:0; top:0; bottom:0; width:3px; background:var(--green); }
     .nd-v2 .topic-line.politics,.nd-v2 .topic-line.global { background:var(--blue); } .nd-v2 .topic-line.economy { background:var(--amber); } .nd-v2 .topic-line.society { background:var(--red); } .nd-v2 .topic-line.culture,.nd-v2 .topic-line.entertainment { background:var(--violet); }
-    .nd-v2 .issue-top { display:flex; justify-content:space-between; gap:12px; }
+    .nd-v2 .issue-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
     .nd-v2 .rank { font-family:"JetBrains Mono", Consolas, monospace; font-size:10px; letter-spacing:.16em; color:var(--ink3); }
-    .nd-v2 .topic { display:inline-block; margin-top:8px; padding:3px 8px; border:1px solid currentColor; border-radius:2px; font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.12em; color:var(--green); }
+    .nd-v2 .topic { display:inline-block; margin-top:8px; padding:3px 8px; border:1px solid currentColor; border-radius:2px; font-size:11px; color:var(--green); }
     .nd-v2 .topic.politics,.nd-v2 .topic.global { color:var(--blue); } .nd-v2 .topic.economy { color:var(--amber); } .nd-v2 .topic.society { color:var(--red); } .nd-v2 .topic.culture,.nd-v2 .topic.entertainment { color:var(--violet); }
-    .nd-v2 .heat { width:54px; height:54px; border-radius:50%; border:4px solid var(--line); display:flex; align-items:center; justify-content:center; font-family:"JetBrains Mono", Consolas, monospace; font-weight:800; color:var(--green); }
+    .nd-v2 .tstatus { flex:0 0 auto; padding:4px 9px; font-size:12px; font-weight:800; border-radius:2px; }
+    .nd-v2 .tstatus.covered { color:var(--green); background:rgba(47,125,90,.12); }
+    .nd-v2 .tstatus.weak { color:#fff; background:var(--amber); }
+    .nd-v2 .tstatus.missing { color:#fff; background:var(--red); }
     .nd-v2 .issue-card h3 { margin:0; font-size:19px; line-height:1.38; letter-spacing:-.015em; }
     .nd-v2 .issue-card p { margin:0; font-size:14px; color:var(--ink2); line-height:1.6; }
-    .nd-v2 .why { margin-top:auto; padding-top:10px; border-top:1px dashed var(--line2); font-size:13px; color:var(--ink3); line-height:1.6; }
-    .nd-v2 .why b { color:var(--green); font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.16em; }
     .nd-v2 .mini-metrics { display:flex; gap:18px; padding-top:10px; border-top:1px dashed var(--line2); }
-    .nd-v2 .mini-lbl { font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.14em; color:var(--ink3); text-transform:uppercase; }
+    .nd-v2 .mini-lbl { font-size:11px; color:var(--ink3); }
     .nd-v2 .mini-val { font-family:"JetBrains Mono", Consolas, monospace; font-size:16px; font-weight:700; }
-    .nd-v2 .heatmap { overflow-x:auto; }
-    .nd-v2 .hm { display:grid; grid-template-columns:220px repeat(var(--press-count), minmax(28px, 1fr)); gap:2px; min-width:920px; }
-    .nd-v2 .hm-head { font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; letter-spacing:.12em; color:var(--ink3); align-self:end; }
-    .nd-v2 .hpress { height:96px; writing-mode:vertical-rl; transform:none; font-size:12px; color:var(--ink2); text-align:left; }
-    .nd-v2 .hpress.base { color:var(--ink); font-size:14px; font-weight:900; background:rgba(160,105,19,.18); border:1px solid rgba(160,105,19,.35); }
-    .nd-v2 .ilabel { display:flex; gap:8px; align-items:center; padding:6px 8px 6px 0; font-size:13px; line-height:1.35; }
-    .nd-v2 .ilabel .num { color:var(--green); font-family:"JetBrains Mono", Consolas, monospace; }
-    .nd-v2 .cell { aspect-ratio:1; background:var(--panel); display:flex; align-items:center; justify-content:center; font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; color:var(--ink3); }
-    .nd-v2 .cell.l1 { background:rgba(47,125,90,.14); color:var(--green); } .nd-v2 .cell.l2 { background:rgba(47,125,90,.42); color:var(--ink); } .nd-v2 .cell.l3 { background:var(--green); color:#fff; font-weight:800; }
-    .nd-v2 .alerts { display:flex; flex-direction:column; gap:1px; background:var(--line2); }
-    .nd-v2 .alert { display:grid; grid-template-columns:110px 1fr; gap:18px; padding:15px 18px; background:var(--bg); border-left:2px solid var(--red); }
-    .nd-v2 .alert-tag { font-family:"JetBrains Mono", Consolas, monospace; font-size:9px; color:var(--red); letter-spacing:.18em; }
-    .nd-v2 .alert-title { font-size:17px; font-weight:800; margin-bottom:6px; }
-    .nd-v2 .alert-meta { font-size:14px; color:var(--ink2); line-height:1.6; }
-    .nd-v2 .alert-meta .lbl { color:var(--ink3); margin-right:6px; font-family:"JetBrains Mono", Consolas, monospace; }
+    .nd-v2 .chips { display:flex; flex-wrap:wrap; gap:4px; }
+    .nd-v2 .chip { padding:2px 7px; font-size:12px; color:var(--ink2); background:var(--bg); border:1px solid var(--line); border-radius:2px; }
+    .nd-v2 .chip.base { color:var(--ink); font-weight:800; background:rgba(160,105,19,.18); border-color:rgba(160,105,19,.4); }
+    .nd-v2 .chip.absent { color:var(--red); font-weight:800; border:1px dashed var(--red); background:transparent; }
+    .nd-v2 .why { margin-top:auto; padding-top:10px; border-top:1px dashed var(--line2); font-size:13px; color:var(--ink2); line-height:1.6; }
+    .nd-v2 .why b { color:var(--amber); margin-right:6px; }
     .nd-v2 .press-table { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1px; background:var(--line2); }
-    .nd-v2 .press-col { background:var(--bg); }
-    .nd-v2 .press-row { display:grid; grid-template-columns:28px 1fr 48px; gap:8px; padding:9px 14px; align-items:center; background:var(--panel); }
+    .nd-v2 .press-col { background:var(--bg); min-width:0; overflow:hidden; }
+    .nd-v2 .press-row { display:grid; grid-template-columns:28px 1fr 64px; gap:8px; padding:9px 14px; align-items:center; background:var(--panel); min-width:0; }
     .nd-v2 .press-idx { font-family:"JetBrains Mono", Consolas, monospace; color:var(--ink3); font-size:10px; }
     .nd-v2 .press-name { font-weight:800; display:flex; gap:8px; align-items:center; }
-    .nd-v2 .base { font-family:"JetBrains Mono", Consolas, monospace; font-size:8px; padding:2px 5px; background:var(--amber); color:#000; }
+    .nd-v2 .base-tag { font-family:"JetBrains Mono", Consolas, monospace; font-size:8px; padding:2px 5px; background:var(--amber); color:#000; }
     .nd-v2 .story-list { padding:8px 14px 14px; }
-    .nd-v2 .story { display:flex; gap:8px; padding:5px 0; color:var(--ink2); font-size:14px; line-height:1.5; }
+    .nd-v2 .story { display:flex; gap:8px; padding:5px 0; color:var(--ink2); font-size:14px; line-height:1.5; align-items:baseline; }
     .nd-v2 .story .bullet { color:var(--green); flex:0 0 auto; }
-    .nd-v2 .issue-card h3,
-    .nd-v2 .issue-card p,
-    .nd-v2 .why,
-    .nd-v2 .alert-title,
-    .nd-v2 .alert-meta,
-    .nd-v2 .story span:last-child,
-    .nd-v2 .press-name,
-    .nd-v2 .flow,
-    .nd-v2 .note { min-width:0; overflow-wrap:anywhere; word-break:keep-all; }
-    .nd-v2 .story span:last-child { display:block; }
-    .nd-v2 .press-row { min-width:0; }
-    .nd-v2 .issue-grid { align-items:stretch; }
-    .nd-v2 .press-col { min-width:0; overflow:hidden; }
+    .nd-v2 .story-title { flex:1 1 auto; min-width:0; }
+    .nd-v2 .ref-media { flex:0 0 auto; font-size:12px; font-weight:700; color:var(--ink); }
+    .nd-v2 .ref-exp { flex:0 0 auto; font-size:11px; color:var(--ink3); }
+    .nd-v2 .issue-card h3, .nd-v2 .issue-card p, .nd-v2 .why, .nd-v2 .alert-title, .nd-v2 .alert-meta, .nd-v2 .story-title, .nd-v2 .press-name, .nd-v2 .flow, .nd-v2 .note { min-width:0; overflow-wrap:anywhere; word-break:keep-all; }
     .nd-v2 a { color:inherit; text-decoration:none; } .nd-v2 a:hover { text-decoration:underline; }
     .nd-v2 .empty { padding:18px; background:var(--panel); color:var(--ink2); border:1px dashed var(--line2); }
-    @media (max-width:900px) { .nd-v2 .hero,.nd-v2 .main-grid { grid-template-columns:1fr; } .nd-v2 .metrics,.nd-v2 .issue-grid,.nd-v2 .press-table { grid-template-columns:1fr; } .nd-v2 .tabs,.nd-v2 .status { display:none; } }
+    @media (max-width:900px) { .nd-v2 .hero { grid-template-columns:1fr; } .nd-v2 .metrics { grid-template-columns:repeat(2, 1fr); } .nd-v2 .issue-grid,.nd-v2 .press-table { grid-template-columns:1fr; } .nd-v2 .alert { grid-template-columns:1fr; gap:8px; } .nd-v2 .status-bar { display:none; } }
     </style>
     """
 
-    issue_cards = []
-    for idx, issue in enumerate(issues[:6], start=1):
-        rank = issue.get("rank", idx)
-        title = safe_html(issue.get("issue_title"), "이슈명 없음")
-        category = to_plain_display_text(issue.get("category")) or "기타"
-        cat_class = category_class(category)
-        summary_text = safe_html(issue.get("one_line_summary"), "요약 없음")
-        why = safe_html(issue.get("why_it_matters"), "중요도 판단 정보 없음")
-        heat = issue_heat(issue)
-        coverage = issue_coverage(issue, news_data)
-        issue_cards.append(
-            f'<div class="issue-card"><div class="topic-line {cat_class}"></div>'
-            f'<div class="issue-top"><div><div class="rank mono">ISSUE #{html.escape(str(rank)).zfill(2)}</div>'
-            f'<span class="topic {cat_class}">{html.escape(category)}</span></div><div class="heat">{heat}</div></div>'
-            f'<h3>{title}</h3><p>{summary_text}</p>'
-            f'<div class="mini-metrics"><div><div class="mini-lbl">Coverage</div>'
-            f'<div class="mini-val">{coverage}<span style="color:var(--ink3);font-size:11px">/{len(URLS)}</span></div></div>'
-            f'<div><div class="mini-lbl">Heat</div><div class="mini-val">{heat}</div></div></div>'
-            f'<div class="why"><b>WHY</b> {why}</div></div>'
-        )
-    if not issue_cards:
-        issue_cards.append('<div class="empty">저장된 AI 이슈 분석 결과가 아직 없습니다.</div>')
-
-    kw_html = []
-    for row in keywords:
-        width = int(row["count"] / max_keyword_count * 100)
-        kw_html.append(f'<div class="kw-row"><span class="kw-name">{safe_html(row["keyword"])}</span><span class="bar"><span class="fill" style="width:{width}%"></span></span><span>{row["count"]:02d}</span></div>')
-
-    hm_cells = ['<div class="hm-head">ISSUE / PRESS</div>']
-    for press in presses:
-        base_class = " base" if press == TARGET_PRESS else ""
-        hm_cells.append(f'<div class="hpress{base_class}">{html.escape(str(press))}</div>')
-    for row_idx, issue in enumerate(issues[:6]):
-        label = truncate_text(issue.get("issue_title", ""), 26)
-        hm_cells.append(f'<div class="ilabel"><span class="num">#{row_idx + 1}</span><span>{html.escape(label)}</span></div>')
-        for value in heatmap[row_idx] if row_idx < len(heatmap) else []:
-            level = f" l{value}" if value else ""
-            hm_cells.append(f'<div class="cell{level}">{value if value else ""}</div>')
-
-    missed_html = []
-    for idx, item in enumerate(missed_articles[:5], start=1):
-        rank = item.get("rank", idx)
-        missed_html.append(
-            f'<div class="alert"><div class="alert-tag">MISSED #{html.escape(str(rank))}</div><div>'
-            f'<div class="alert-title">{safe_html(item.get("issue_title"), "이슈명 없음")}</div>'
-            f'<div class="alert-meta"><span class="lbl">REASON</span>{safe_html(item.get("why_missed"))}</div>'
-            f'<div class="alert-meta" style="margin-top:4px"><span class="lbl">SIGNAL</span>{safe_html(item.get("coverage_signal"))}</div>'
+    gap_html = []
+    for issue in gaps:
+        status = issue.get("target_status", "")
+        others = [a for a in issue.get("articles", []) if a.get("media") != TARGET_PRESS][:4]
+        target_refs = [a for a in issue.get("articles", []) if a.get("media") == TARGET_PRESS][:2]
+        angle = issue.get("suggested_angle")
+        angle_html = f'<div class="alert-meta"><span class="lbl">보강 방향</span>{safe_html(angle)}</div>' if angle else ""
+        gap_html.append(
+            f'<div class="alert {STATUS_CLASS.get(status, "missing")}">'
+            f'<div><span class="alert-tag">{safe_html(status)}</span>'
+            f'<div class="alert-num">타사 {int(issue.get("other_outlet_count", 0))}곳</div>'
+            f'<div class="alert-sub">{target} {int(issue.get("target_article_count", 0))}건</div></div>'
+            f'<div><div class="alert-title">{safe_html(issue.get("topic"), "이슈명 없음")}</div>'
+            f'<div class="alert-meta"><span class="lbl">{target}</span>{safe_html(issue.get("target_note"), "-")}</div>'
+            f'{angle_html}'
+            f'<div class="alert-meta"><span class="lbl">노출 비교</span>{target} {format_exposure(issue.get("target_exposure"))}'
+            f' · 타사 중앙값 {format_exposure(issue.get("other_median_exposure"))}</div>'
+            f'<div class="refs">{"".join(article_link_html(a, show_media=True) for a in target_refs + others)}</div>'
             f'</div></div>'
         )
-    if not missed_html:
-        missed_html.append(f'<div class="empty">현재 기준으로 {html.escape(TARGET_PRESS)}가 뚜렷하게 놓친 주요 이슈는 발견되지 않았습니다.</div>')
+    if not gap_html:
+        if ai_data.get("error"):
+            gap_html.append(f'<div class="empty">{safe_html(ai_data.get("error"))}</div>')
+        else:
+            gap_html.append(
+                f'<div class="empty">타사 {gap_min_outlets}곳 이상이 다룬 이슈 가운데 {target}가 누락하거나 소홀히 다룬 이슈는 아직 없습니다.</div>'
+            )
+
+    issue_cards = []
+    for issue in issues:
+        status = issue.get("target_status", "")
+        cat = category_class(issue.get("category"))
+        chips = []
+        for press in issue.get("presses", []):
+            base = " base" if press == TARGET_PRESS else ""
+            chips.append(f'<span class="chip{base}">{html.escape(str(press))}</span>')
+        if TARGET_PRESS not in issue.get("presses", []):
+            chips.append(f'<span class="chip absent">{target} 없음</span>')
+        issue_cards.append(
+            f'<div class="issue-card"><div class="topic-line {cat}"></div>'
+            f'<div class="issue-top"><div><div class="rank">ISSUE #{int(issue.get("rank", 0)):02d}</div>'
+            f'<span class="topic {cat}">{safe_html(issue.get("category"), "기타")}</span></div>'
+            f'<span class="tstatus {STATUS_CLASS.get(status, "covered")}">{target} {safe_html(status)}</span></div>'
+            f'<h3>{safe_html(issue.get("topic"), "이슈명 없음")}</h3><p>{safe_html(issue.get("summary"))}</p>'
+            f'<div class="mini-metrics">'
+            f'<div><div class="mini-lbl">보도 매체</div><div class="mini-val">{int(issue.get("outlet_count", 0))}<span style="color:var(--ink3);font-size:11px">/{len(URLS)}</span></div></div>'
+            f'<div><div class="mini-lbl">기사</div><div class="mini-val">{int(issue.get("article_count", 0))}</div></div>'
+            f'<div><div class="mini-lbl">누적 노출</div><div class="mini-val">{format_exposure(issue.get("total_exposure"))}</div></div></div>'
+            f'<div class="chips">{"".join(chips)}</div>'
+            f'<div class="why"><b>{target}</b>{safe_html(issue.get("target_note"), "-")}</div></div>'
+        )
+    if not issue_cards:
+        issue_cards.append(f'<div class="empty">{safe_html(ai_data.get("error"), "분석된 이슈가 아직 없습니다.")}</div>')
 
     press_html = []
-    for idx, (press, articles) in enumerate(news_data.items(), start=1):
-        base = '<span class="base">BASE</span>' if press == TARGET_PRESS else ''
-        stories = []
-        for article in (articles or [])[:6]:
-            title = clean_article_title(article.get("title", ""))
-            if not title:
-                continue
-            url = article.get("url")
-            content = f'<a href="{html.escape(str(url))}" target="_blank">{html.escape(title)}</a>' if url else html.escape(title)
-            stories.append(f'<div class="story"><span class="bullet">›</span><span>{content}</span></div>')
+    for idx, (press, articles) in enumerate(press_articles.items(), start=1):
+        base = '<span class="base-tag">BASE</span>' if press == TARGET_PRESS else ''
+        stories = [article_link_html(a) for a in articles]
         if not stories:
-            stories.append('<div class="story"><span class="bullet">›</span><span>최신 뉴스를 불러오지 못했습니다.</span></div>')
+            stories.append('<div class="story"><span class="bullet">›</span><span>오늘 수집된 기사가 아직 없습니다.</span></div>')
         press_html.append(
             f'<div class="press-col"><div class="press-row"><span class="press-idx">{idx:02d}</span>'
             f'<span class="press-name">{html.escape(str(press))}{base}</span>'
-            f'<span class="mono" style="color:var(--ink3);text-align:right">{len(articles or [])}</span></div>'
+            f'<span class="mono" style="color:var(--ink3);text-align:right">{press_counts.get(press, 0)}건</span></div>'
             f'<div class="story-list">{"".join(stories)}</div></div>'
         )
 
-    error_html = f'<div class="empty" style="margin-bottom:12px">{safe_html(ai_data.get("error"))}</div>' if ai_data.get("error") else ""
     st.markdown(css + f"""
     <div class="nd-v2">
-      <div class="topnav"><div style="display:flex;align-items:center"><div class="brand mono">NEWSDESK TERMINAL</div><div class="tabs mono"><div class="tab active">DASHBOARD</div><div class="tab">ISSUES</div><div class="tab">COVERAGE</div><div class="tab">KEYWORDS</div></div></div><div class="status mono"><span class="live">LIVE</span><span>REFRESH 10MIN</span><span>{html.escape(format_refresh_slot(refresh_slot))}</span></div></div>
-      <div class="hero"><div><div class="eyebrow mono">NEWS TREND BRIEF / KST</div><h1>실시간 네이버 <span>뉴스 현황</span></h1><div class="sub">주요 언론사의 네이버 뉴스 제목과 저장된 AI 분석 결과를 한 화면에서 확인합니다. 기준 매체는 <b>{html.escape(TARGET_PRESS)}</b>입니다.</div></div>
-        <div class="metrics"><div class="metric"><div class="lbl">Tracked</div><div class="val">{len(news_data)}<span style="font-size:11px;color:var(--ink3)"> outlets</span></div><div class="subv">{total_headlines} headlines</div></div><div class="metric"><div class="lbl">Issues</div><div class="val green">{len(issues[:6]):02d}</div><div class="subv">AI selected</div></div><div class="metric"><div class="lbl">Missed</div><div class="val amber">{len(missed_articles[:5]):02d}</div><div class="subv">vs. {html.escape(TARGET_PRESS)}</div></div><div class="metric"><div class="lbl">AI Calls</div><div class="val">{html.escape(str(today_ai_calls))}<span style="font-size:11px;color:var(--ink3)"> / {display_daily_limit}</span></div><div class="subv">{html.escape(last_model)}</div></div></div></div>
-      <div class="main-grid"><div class="panel"><div class="panel-head"><h2>AI 에디터의 흐름 분석</h2><span class="meta">UPDATED {html.escape(last_analysis)}</span></div>{error_html}<div class="flow">{safe_html(summary.get('overall_trend'), '저장된 AI 분석 결과가 아직 없습니다.')}</div><div class="note"><div class="badge">EDIT<br>NOTE</div><div>{safe_html(summary.get('editorial_note'), '편집 방향 제안이 아직 없습니다.')}</div></div></div><div class="panel"><div class="panel-head"><h2>키워드 빈도</h2><span class="meta">N={total_headlines}</span></div><div class="kw-list">{''.join(kw_html)}</div></div></div>
-      <div class="panel full"><div class="panel-head"><h2>핵심 이슈 / HEAT × COVERAGE</h2><span class="meta">6 ISSUES</span></div><div class="issue-grid">{''.join(issue_cards)}</div></div>
-      <div class="panel full"><div class="panel-head"><h2>이슈 × 언론사 보도 매트릭스</h2><span class="meta">DARKER = MORE COVERAGE</span></div><div class="heatmap"><div class="hm" style="--press-count:{max(len(presses),1)}">{''.join(hm_cells)}</div></div></div>
-      <div class="panel full"><div class="panel-head"><h2>국민일보가 놓친 기사</h2><span class="meta">DETECTED IN OTHER OUTLETS</span></div><div class="alerts">{''.join(missed_html)}</div></div>
-      <div class="panel full"><div class="panel-head"><h2>언론사별 헤드라인</h2><span class="meta">TOP 6 PER OUTLET</span></div><div class="press-table">{''.join(press_html)}</div></div>
+      <div class="topnav"><div class="brand mono">NEWSDESK MONITOR</div><div class="status-bar mono"><span class="live">LIVE</span><span>COLLECT 10MIN</span><span>{html.escape(format_refresh_slot(refresh_slot))}</span></div></div>
+      <div class="hero"><div><div class="eyebrow mono">DAILY COVERAGE / KST {html.escape(day_key)}</div><h1>오늘 언론이 주목한 이슈와<br><span class="accent">{target} 보도 공백</span></h1><div class="sub">{html.escape(day_key)} 00시부터 지금까지 {len(URLS)}개 언론사의 네이버 언론사 홈 주요 기사를 누적해, 많이 다룬 이슈와 {target}의 누락·소홀 여부를 비교합니다.</div></div>
+        <div class="metrics">
+          <div class="metric"><div class="lbl">오늘 누적 기사</div><div class="val">{article_total}</div><div class="subv">{len([p for p in press_counts if press_counts[p]])}개 언론사</div></div>
+          <div class="metric"><div class="lbl">핵심 이슈</div><div class="val green">{len(issues):02d}</div><div class="subv">2곳 이상 보도</div></div>
+          <div class="metric"><div class="lbl">누락·소홀</div><div class="val red">{len(gaps):02d}</div><div class="subv">누락 {missing_count} · 소홀 {weak_count}</div></div>
+          <div class="metric"><div class="lbl">AI 호출</div><div class="val">{html.escape(str(today_ai_calls))}<span style="font-size:11px;color:var(--ink3)"> / {display_daily_limit}</span></div><div class="subv">{html.escape(last_model)}</div></div>
+        </div></div>
+      <div class="panel"><div class="panel-head"><h2>오늘의 보도 흐름</h2><span class="meta">UPDATED {html.escape(last_analysis)}</span></div><div class="flow">{safe_html(ai_data.get('daily_summary'), '분석 결과를 기다리는 중입니다.')}</div><div class="note"><div class="badge">{target}</div><div>{safe_html(ai_data.get('target_assessment'), '-')}</div></div></div>
+      <div class="panel"><div class="panel-head"><h2>{target} 누락·소홀 이슈</h2><span class="meta">타사 {gap_min_outlets}곳 이상 보도 기준</span></div><div class="alerts">{''.join(gap_html)}</div></div>
+      <div class="panel"><div class="panel-head"><h2>핵심 이슈 — 많이 다룬 순</h2><span class="meta">보도 매체 수 · 누적 노출 순</span></div><div class="issue-grid">{''.join(issue_cards)}</div></div>
+      <div class="panel"><div class="panel-head"><h2>언론사별 오늘 주요 기사</h2><span class="meta">노출 시간 순 상위 8건</span></div><div class="press-table">{''.join(press_html)}</div></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1468,12 +1252,8 @@ def render_v2_dashboard(ai_data, news_data, dashboard_stats, refresh_slot):
 refresh_slot = get_current_refresh_slot()
 st_autorefresh(interval=UI_POLL_INTERVAL_MS, limit=None, key="news_autorefresh")
 
-
 dashboard_stats = get_dashboard_stats()
-with st.spinner("언론사별 주요 뉴스를 수집 중입니다..."):
-    news_data = fetch_news(refresh_slot)
+press_articles, press_counts = load_today_press_articles(refresh_slot[:10])
+ai_insight = get_stored_ai_insight()
 
-with st.spinner("저장된 AI 분석 결과를 불러오고 있습니다..."):
-    ai_insight = get_stored_ai_insight()
-
-render_v2_dashboard(ai_insight, news_data, dashboard_stats, refresh_slot)
+render_dashboard(ai_insight, press_articles, press_counts, dashboard_stats, refresh_slot)

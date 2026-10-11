@@ -7,12 +7,21 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import statistics
 import time
 from zoneinfo import ZoneInfo
 
 
 TARGET_PRESS = "국민일보"
-AI_CACHE_VERSION = "minimal-fields-v1"
+AI_CACHE_VERSION = "daily-coverage-v1"
+ARTICLE_RETENTION_DAYS = 7
+PROMPT_MAX_ARTICLES_PER_PRESS = 40
+PROMPT_MAX_TARGET_ARTICLES = 80
+MAX_ISSUES = 12
+# 타사 몇 곳 이상이 다룬 이슈부터 국민일보 누락·소홀 후보로 보는지
+MIN_OUTLETS_FOR_GAP = 3
+# 국민일보 노출 합계가 타사 노출 중앙값의 이 비율보다 낮으면 '소홀'
+UNDERCOVERED_RATIO = 0.5
 PRIMARY_MODEL_NAME = "gemini-3.5-flash-lite"
 REFRESH_INTERVAL_MINUTES = 10
 SERVICE_UNAVAILABLE_THRESHOLD = 2
@@ -152,6 +161,19 @@ def init_ai_store():
                 error TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_key TEXT NOT NULL,
+                press TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT,
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                seen_count INTEGER NOT NULL,
+                UNIQUE(day_key, press, title)
+            )
+        """)
 
 
 def get_kst_now():
@@ -264,6 +286,8 @@ def cleanup_expired_store():
         conn.execute("DELETE FROM refresh_locks WHERE acquired_at < ?", (cutoff,))
         conn.execute("DELETE FROM ai_cache WHERE generated_at < ?", (cutoff,))
         conn.execute("DELETE FROM model_attempt_log WHERE ts < ?", (cutoff,))
+        oldest_day = (get_kst_now() - timedelta(days=ARTICLE_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        conn.execute("DELETE FROM daily_articles WHERE day_key < ?", (oldest_day,))
 
 
 def acquire_refresh_lock():
@@ -635,221 +659,113 @@ def sanitize_ai_text(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def sanitize_ai_payload(ai_data):
-    if not isinstance(ai_data, dict):
-        return ai_data
+def store_daily_articles(news_data, day_key):
+    init_ai_store()
+    now = time.time()
+    with closing(get_db_connection()) as conn:
+        conn.execute("BEGIN")
+        for press, articles in news_data.items():
+            for article in articles:
+                title = (article.get("title") or "").strip()
+                if not title or "데이터를 불러올 수 없습니다" in title:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO daily_articles (day_key, press, title, url, first_seen, last_seen, seen_count)
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(day_key, press, title) DO UPDATE SET
+                        url = COALESCE(excluded.url, daily_articles.url),
+                        last_seen = excluded.last_seen,
+                        seen_count = daily_articles.seen_count + 1
+                    """,
+                    (day_key, press, title, article.get("url"), now, now),
+                )
+        conn.execute("COMMIT")
 
-    summary = ai_data.get("dashboard_summary")
-    if isinstance(summary, dict):
-        for key in ["overall_trend", "editorial_note"]:
-            summary[key] = sanitize_ai_text(summary.get(key, ""))
-        summary["top_keywords"] = [
-            clean_keyword
-            for keyword in summary.get("top_keywords", []) or []
-            for clean_keyword in [sanitize_ai_text(keyword)]
-            if clean_keyword
-        ]
 
-    for issue in ai_data.get("issues", []) or []:
-        if not isinstance(issue, dict):
+def load_daily_articles(day_key):
+    init_ai_store()
+    with closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, press, title, url, first_seen, last_seen, seen_count
+            FROM daily_articles WHERE day_key = ?
+            ORDER BY seen_count DESC, first_seen ASC
+            """,
+            (day_key,),
+        ).fetchall()
+    return [
+        {
+            "id": f"a{row['id']}",
+            "press": row["press"],
+            "title": row["title"],
+            "url": row["url"],
+            "first_seen": row["first_seen"],
+            "seen_count": int(row["seen_count"]),
+        }
+        for row in rows
+    ]
+
+
+def format_articles_for_prompt(articles):
+    by_press = {press: [] for press in URLS}
+    for article in articles:
+        by_press.setdefault(article["press"], []).append(article)
+
+    lines = []
+    for press, rows in by_press.items():
+        limit = PROMPT_MAX_TARGET_ARTICLES if press == TARGET_PRESS else PROMPT_MAX_ARTICLES_PER_PRESS
+        rows = sorted(rows, key=lambda a: (-a["seen_count"], a["first_seen"]))[:limit]
+        if not rows:
             continue
-        for key in ["issue_title", "category", "one_line_summary", "why_it_matters", "editor_comment"]:
-            issue[key] = sanitize_ai_text(issue.get(key, ""))
-
-    for item in ai_data.get("missed_articles", []) or []:
-        if not isinstance(item, dict):
-            continue
-        for key in ["issue_title", "category", "why_missed", "coverage_signal", "suggested_angle"]:
-            item[key] = sanitize_ai_text(item.get(key, ""))
-
-    return ai_data
+        lines.append(f"[{press}]")
+        for article in rows:
+            title = article["title"].replace("|", " ")
+            lines.append(f"{article['id']}|{title}|노출{article['seen_count']}")
+    return "\n".join(lines)
 
 
-def build_ai_persona_prompt_legacy(news_data):
-    input_articles = []
-
-    for press, articles in news_data.items():
-        for article in articles:
-            title = article.get("title", "")
-            url = article.get("url")
-            if title and "데이터를 불러올 수 없습니다" not in title:
-                input_articles.append({
-                    "media": press,
-                    "title": title,
-                    "url": url,
-                })
-
-    articles_json = json.dumps(input_articles, ensure_ascii=False, indent=2)
+def build_ai_persona_prompt(articles, day_key):
+    articles_text = format_articles_for_prompt(articles)
+    outlet_count = len({a["press"] for a in articles})
 
     return f"""
-너는 “뉴스 트렌드 에디터 AI”다.
+당신은 {TARGET_PRESS} 편집국의 보도 모니터링을 돕는 AI 에디터입니다.
 
-주요 언론사의 네이버채널 뉴스 제목 목록을 분석해 현재 핵심 뉴스 이슈 6개를 정리하고,
-{TARGET_PRESS} 주요 뉴스 목록에는 보이지 않지만 타 언론에서 반복되는 이슈를 찾아라.
+아래는 오늘(KST {day_key}) 0시부터 지금까지 10분 간격으로 수집해 누적한 언론사 {outlet_count}곳의 네이버 언론사 홈 주요 기사 제목입니다.
+- 형식: 기사ID|제목|노출N
+- 노출N은 그 기사가 언론사 홈 주요 기사 영역에 걸려 있던 수집 횟수입니다(1회 = 약 10분). 값이 클수록 그 언론사가 오래, 비중 있게 다룬 기사입니다.
+- 기사 본문은 없습니다. 제목에 없는 사실을 추정하거나 단정하지 마세요.
 
-중요:
-- 기사 본문은 제공되지 않는다.
-- 기사 제목에 없는 사실을 임의로 추정하거나 단정하지 마라.
-- 결과는 반드시 JSON만 출력하라.
-- HTML, Markdown, 코드블록을 절대 출력하지 마라.
-- 어떤 문자열 값에도 <div>, <span>, <p>, <br>, <a>, class=, ``` 같은 조각을 넣지 마라.
+분석 목적:
+언론사들이 오늘 중요하게 다룬 이슈를 파악하고, {TARGET_PRESS}가 그 이슈를 누락했거나 소홀히 다뤘는지 판단하는 것입니다.
 
-카테고리는 반드시 아래 중 하나만 사용하라.
-정치, 경제, 사회, 국제, 생활, IT·과학, 문화, 스포츠, 연예, 오피니언, 기타
-
-점수는 1점부터 5점까지 정수로 부여하라.
-
-반드시 아래 JSON 형식으로만 출력하라.
-
-{{
-  "dashboard_summary": {{
-    "overall_trend": "오늘 뉴스 흐름에 대한 2~3문장 요약",
-    "top_keywords": ["키워드1", "키워드2", "키워드3", "키워드4", "키워드5"],
-    "editorial_note": "편집자가 참고할 전체 코멘트"
-  }},
-  "issues": [
-    {{
-      "rank": 1,
-      "issue_title": "핵심 이슈명",
-      "category": "정치",
-      "one_line_summary": "이슈 한 줄 요약",
-      "why_it_matters": "이 이슈가 중요한 이유",
-      "related_articles": [
-        {{
-          "media": "언론사명",
-          "title": "기사 제목",
-          "url": "기사 URL 또는 null"
-        }}
-      ],
-      "recommended_article": {{
-        "media": "언론사명",
-        "title": "노출 추천 기사 제목",
-        "url": "기사 URL 또는 null",
-        "reason": "이 기사를 추천하는 이유"
-      }},
-      "scores": {{
-        "importance": 1,
-        "virality": 1,
-        "reader_interest": 1,
-        "freshness": 1
-      }},
-      "editor_comment": "편집 관점의 짧은 코멘트"
-    }}
-  ],
-  "missed_articles": [
-    {{
-      "rank": 1,
-      "issue_title": "{TARGET_PRESS}가 놓친 것으로 보이는 이슈명",
-      "category": "정치",
-      "why_missed": "왜 {TARGET_PRESS}가 놓친 기사로 판단했는지",
-      "coverage_signal": "다른 언론 몇 곳 또는 어떤 언론들이 다루고 있는지",
-      "suggested_angle": "{TARGET_PRESS}가 이 이슈를 어떤 관점으로 다루면 좋을지",
-      "urgency_score": 1,
-      "reference_articles": [
-        {{
-          "media": "타 언론사명",
-          "title": "참고 기사 제목",
-          "url": "기사 URL 또는 null"
-        }}
-      ]
-    }}
-  ]
-}}
-
-추가 규칙:
-- issues 배열은 반드시 6개여야 한다.
-- missed_articles 배열은 최대 5개까지 출력하라.
-- 놓친 이슈가 없다면 missed_articles는 빈 배열 []로 출력하라.
-- related_articles에는 입력 기사 목록에 실제 존재하는 기사만 넣어라.
-- recommended_article은 반드시 related_articles 안에 있는 기사 중에서 선택하라.
-- URL이 없는 경우 null로 표시하라.
-
-[기사 목록]
-{articles_json}
-"""
-
-
-def build_ai_persona_prompt(news_data):
-    input_articles = []
-
-    for press, articles in news_data.items():
-        for article in articles:
-            title = article.get("title", "")
-            url = article.get("url")
-            if title and "데이터를 불러오지 못했습니다" not in title:
-                input_articles.append({
-                    "media": press,
-                    "title": title,
-                    "url": url,
-                })
-
-    articles_json = json.dumps(input_articles, ensure_ascii=False, separators=(",", ":"))
-
-    return f"""
-당신은 한국 뉴스 편집 데스크를 보조하는 AI 에디터입니다.
-
-아래에는 네이버 언론사별 주요 뉴스 제목만 제공됩니다. 기사 본문은 제공되지 않습니다.
-제목에 없는 사실을 추정하거나 단정하지 말고, 제목 목록에서 반복적으로 드러나는 흐름만 분석하세요.
-
-목표:
-- 현재 뉴스 트렌드를 2~3문장으로 요약합니다.
-- 핵심 키워드 5개를 고릅니다.
-- 편집 방향 제안 1개를 작성합니다.
-- 현재 핫이슈 6개를 선정합니다.
-- 기준 매체인 {TARGET_PRESS} 주요 뉴스 목록에는 없지만, 다른 언론에서 반복적으로 다루는 이슈를 최대 5개 제안합니다.
+해야 할 일:
+1. 같은 사건·주제를 다룬 기사를 하나의 이슈로 묶으세요. 표현이 달라도 같은 사안이면 같은 이슈입니다.
+2. 2곳 이상의 언론사가 다룬 이슈를 최대 {MAX_ISSUES}개 고르세요. 다룬 언론사 수가 많고 노출이 큰 이슈를 우선합니다.
+3. article_ids에는 그 이슈에 해당하는 기사 ID를 언론사 구분 없이 빠짐없이 넣으세요. {TARGET_PRESS} 기사가 해당되면 반드시 포함하세요.
+4. target_note: 해당 이슈에 대한 {TARGET_PRESS} 보도를 타사와 비교해 1~2문장으로 쓰세요(기사 수, 노출 비중, 관점 차이). {TARGET_PRESS} 기사가 없으면 없다고 쓰세요.
+5. suggested_angle: {TARGET_PRESS} 보도가 없거나 약하면 보강 방향을 1문장으로 쓰고, 충분하면 빈 문자열로 두세요.
+6. daily_summary: 오늘 언론 전체가 집중한 흐름을 2~3문장으로 요약하세요.
+7. target_assessment: 타사 대비 {TARGET_PRESS}의 오늘 보도 특징과 공백을 2~3문장으로 평가하세요.
 
 출력 규칙:
-- 반드시 JSON 객체 하나만 출력하세요.
-- Markdown, HTML, 코드블록, 설명 문장을 출력하지 마세요.
-- 모든 문자열 값에는 HTML 태그나 class 속성을 넣지 마세요.
-- 점수는 1~5 사이 정수만 사용하세요.
-- URL이 없으면 null을 사용하세요.
-- related_articles와 reference_articles에는 입력 기사 목록에 실제 존재하는 기사만 넣으세요.
+- JSON 객체 하나만 출력하세요. Markdown, HTML, 코드블록, 설명 문장은 금지입니다.
+- 문자열 값에 HTML 태그나 class 속성을 넣지 마세요.
+- article_ids에는 아래 목록에 실제로 있는 기사ID만 넣으세요.
 
 JSON 스키마:
 {{
-  "dashboard_summary": {{
-    "overall_trend": "현재 뉴스 흐름 요약",
-    "top_keywords": ["키워드1", "키워드2", "키워드3", "키워드4", "키워드5"],
-    "editorial_note": "편집 방향 제안"
-  }},
+  "daily_summary": "오늘 흐름 요약",
+  "target_assessment": "{TARGET_PRESS} 보도 평가",
   "issues": [
     {{
-      "rank": 1,
-      "issue_title": "이슈명",
+      "topic": "이슈명(20자 이내)",
       "category": "정치",
-      "one_line_summary": "이슈 한 줄 요약",
-      "why_it_matters": "중요한 이유",
-      "related_articles": [
-        {{"media": "언론사명", "title": "기사 제목", "url": null}}
-      ],
-      "recommended_article": {{
-        "media": "언론사명",
-        "title": "인용 추천 기사 제목",
-        "url": null,
-        "reason": "추천 이유"
-      }},
-      "scores": {{
-        "importance": 1,
-        "virality": 1,
-        "reader_interest": 1,
-        "freshness": 1
-      }},
-      "editor_comment": "편집 관점 코멘트"
-    }}
-  ],
-  "missed_articles": [
-    {{
-      "rank": 1,
-      "issue_title": "{TARGET_PRESS}가 놓친 것으로 보이는 이슈명",
-      "category": "사회",
-      "why_missed": "놓친 기사로 판단한 이유",
-      "coverage_signal": "다른 언론 보도 신호",
-      "suggested_angle": "{TARGET_PRESS}가 다룰 수 있는 관점",
-      "urgency_score": 1,
-      "reference_articles": [
-        {{"media": "타 언론사명", "title": "참고 기사 제목", "url": null}}
-      ]
+      "summary": "이슈 한 줄 요약",
+      "article_ids": ["a1", "a2"],
+      "target_note": "{TARGET_PRESS} 보도 비교",
+      "suggested_angle": "보강 방향 또는 빈 문자열"
     }}
   ]
 }}
@@ -857,13 +773,78 @@ JSON 스키마:
 카테고리는 다음 중 하나만 사용하세요:
 정치, 경제, 사회, 국제, 생활, IT·과학, 문화, 스포츠·연예, 오피니언, 기타
 
-배열 개수:
-- issues는 반드시 6개입니다.
-- missed_articles는 0~5개입니다.
-
 기사 목록:
-{articles_json}
+{articles_text}
 """
+
+
+def build_dashboard_payload(parsed, articles, day_key):
+    articles_by_id = {a["id"]: a for a in articles}
+    issues = []
+
+    for raw in parsed.get("issues", []) or []:
+        if not isinstance(raw, dict):
+            continue
+
+        ids = []
+        for article_id in raw.get("article_ids", []) or []:
+            article_id = str(article_id).strip()
+            if article_id in articles_by_id and article_id not in ids:
+                ids.append(article_id)
+        if not ids:
+            continue
+
+        related = sorted((articles_by_id[i] for i in ids), key=lambda a: -a["seen_count"])
+        exposure_by_press = {}
+        for article in related:
+            exposure_by_press[article["press"]] = exposure_by_press.get(article["press"], 0) + article["seen_count"]
+
+        other_exposures = [v for press, v in exposure_by_press.items() if press != TARGET_PRESS]
+        target_exposure = exposure_by_press.get(TARGET_PRESS, 0)
+        other_median = statistics.median(other_exposures) if other_exposures else 0
+
+        if not target_exposure:
+            status = "누락"
+        elif target_exposure < other_median * UNDERCOVERED_RATIO:
+            status = "소홀"
+        else:
+            status = "보도"
+
+        issues.append({
+            "topic": sanitize_ai_text(raw.get("topic")) or "이슈명 없음",
+            "category": sanitize_ai_text(raw.get("category")) or "기타",
+            "summary": sanitize_ai_text(raw.get("summary")),
+            "target_note": sanitize_ai_text(raw.get("target_note")),
+            "suggested_angle": sanitize_ai_text(raw.get("suggested_angle")),
+            "outlet_count": len(exposure_by_press),
+            "other_outlet_count": len(other_exposures),
+            "article_count": len(related),
+            "total_exposure": sum(exposure_by_press.values()),
+            "target_article_count": sum(1 for a in related if a["press"] == TARGET_PRESS),
+            "target_exposure": target_exposure,
+            "other_median_exposure": other_median,
+            "target_status": status,
+            "is_gap": status != "보도" and len(other_exposures) >= MIN_OUTLETS_FOR_GAP,
+            "presses": sorted(exposure_by_press, key=lambda p: -exposure_by_press[p]),
+            "articles": [
+                {"media": a["press"], "title": a["title"], "url": a["url"], "seen_count": a["seen_count"]}
+                for a in related
+            ],
+        })
+
+    issues.sort(key=lambda issue: (-issue["outlet_count"], -issue["total_exposure"]))
+    for rank, issue in enumerate(issues, start=1):
+        issue["rank"] = rank
+
+    return {
+        "day_key": day_key,
+        "article_total": len(articles),
+        "outlet_total": len({a["press"] for a in articles}),
+        "gap_min_outlets": MIN_OUTLETS_FOR_GAP,
+        "daily_summary": sanitize_ai_text(parsed.get("daily_summary")),
+        "target_assessment": sanitize_ai_text(parsed.get("target_assessment")),
+        "issues": issues,
+    }
 
 
 def extract_gemini_text(response):
@@ -894,7 +875,7 @@ def call_gemini_model(api_key, model_name, prompt):
         generation_config={
             "temperature": 0.25,
             "top_p": 0.8,
-            "max_output_tokens": 6000,
+            "max_output_tokens": 8192,
             "response_mime_type": "application/json",
         },
     )
@@ -991,8 +972,15 @@ def refresh_ai_for_current_slot():
             print(f"Cache already fresh for slot: {refresh_slot}")
             return 0
 
-        news_data = collect_news()
-        prompt = build_ai_persona_prompt(news_data)
+        day_key = refresh_slot[:10]
+        store_daily_articles(collect_news(), day_key)
+        articles = load_daily_articles(day_key)
+        if not articles:
+            record_slot_attempt(refresh_slot, "skipped", "No articles collected for today.")
+            print("No articles collected for today.")
+            return 0
+
+        prompt = build_ai_persona_prompt(articles, day_key)
         record_slot_attempt(refresh_slot, "running")
         attempt_errors = []
 
@@ -1018,7 +1006,7 @@ def refresh_ai_for_current_slot():
                 try:
                     response_text = call_model(model_config, api_key, model_prompt)
                     parsed = parse_gemini_json(response_text)
-                    if parsed is None:
+                    if not isinstance(parsed, dict):
                         error = f"{model_name}: failed to parse JSON response"
                         record_model_attempt(refresh_slot, model_config, attempt_number, "failed", error)
                         attempt_errors.append(error)
@@ -1030,7 +1018,7 @@ def refresh_ai_for_current_slot():
                             continue
                         break
 
-                    save_ai_result(refresh_slot, sanitize_ai_payload(parsed), model_name)
+                    save_ai_result(refresh_slot, build_dashboard_payload(parsed, articles, day_key), model_name)
                     record_model_attempt(refresh_slot, model_config, attempt_number, "success")
                     record_slot_attempt(refresh_slot, "success", model_name)
                     print(f"AI cache refreshed for slot: {refresh_slot} via {model_name}")
